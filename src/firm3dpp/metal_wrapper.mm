@@ -36,21 +36,22 @@ struct InterpolationTestConstants {
     int x2_count;
     int x3_count;
 
-    double x1_start;
-    double x2_start;
-    double x2_period;
-    double x3_start;
-    double x3_period;
+    float x1_start;
+    float x2_start;
+    float x2_period;
+    float x3_start;
+    float x3_period;
 
-    double x1_step;
-    double x2_step;
-    double x3_step;
+    float x1_step;
+    float x2_step;
+    float x3_step;
 };
 
 struct MetalContext {
     id<MTLDevice> device = nil;
     id<MTLCommandQueue> queue = nil;
-    id<MTLComputePipelineState> pipeline = nil;
+    id<MTLComputePipelineState> pipeline_f64 = nil;
+    id<MTLComputePipelineState> pipeline_f32 = nil;
 };
 
 std::string load_file(const std::string& path) {
@@ -82,6 +83,26 @@ std::string find_kernel_source_path() {
     );
 }
 
+id<MTLComputePipelineState> create_pipeline_state(id<MTLDevice> device, id<MTLLibrary> lib, NSString* kernel_name) {
+    id<MTLFunction> fn = [lib newFunctionWithName:kernel_name];
+    if (fn == nil) {
+        throw std::runtime_error(
+            std::string("Kernel ") + std::string([kernel_name UTF8String]) + " not found in Metal source."
+        );
+    }
+
+    NSError* pso_error = nil;
+    id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:fn error:&pso_error];
+    if (pipeline == nil) {
+        std::string err = pso_error ? std::string([[pso_error localizedDescription] UTF8String]) : "unknown";
+        throw std::runtime_error(
+            std::string("Failed to create Metal pipeline for ")
+            + std::string([kernel_name UTF8String]) + ": " + err
+        );
+    }
+    return pipeline;
+}
+
 MetalContext& metal_context() {
     static MetalContext ctx = []() {
         MetalContext local;
@@ -107,17 +128,8 @@ MetalContext& metal_context() {
                 throw std::runtime_error("Failed to compile Metal source " + kernel_path + ": " + err);
             }
 
-            id<MTLFunction> fn = [lib newFunctionWithName:@"test_gpu_interpolation_kernel"];
-            if (fn == nil) {
-                throw std::runtime_error("Kernel test_gpu_interpolation_kernel not found in " + kernel_path);
-            }
-
-            NSError* pso_error = nil;
-            local.pipeline = [local.device newComputePipelineStateWithFunction:fn error:&pso_error];
-            if (local.pipeline == nil) {
-                std::string err = pso_error ? std::string([[pso_error localizedDescription] UTF8String]) : "unknown";
-                throw std::runtime_error("Failed to create Metal pipeline: " + err);
-            }
+            local.pipeline_f64 = create_pipeline_state(local.device, lib, @"test_gpu_interpolation_kernel");
+            local.pipeline_f32 = create_pipeline_state(local.device, lib, @"test_gpu_interpolation_kernel_f32");
         }
         return local;
     }();
@@ -128,20 +140,36 @@ MetalContext& metal_context() {
 struct RhsSpec {
     int mode;
     int n_fields;
+    bool use_float;
 };
 
-RhsSpec parse_rhs(const std::string& rhs) {
+bool has_suffix(const std::string& value, const std::string& suffix) {
+    if (value.size() < suffix.size()) {
+        return false;
+    }
+    return value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+RhsSpec parse_rhs(std::string rhs) {
+    bool use_float = true;
+    if (has_suffix(rhs, "_f32")) {
+        use_float = true;
+        rhs.erase(rhs.size() - 4);
+    } else if (has_suffix(rhs, "_f64")) {
+        throw std::invalid_argument("Metal f64 mode is not supported on this device/build. Use *_f32.");
+    }
+
     if (rhs == "cartesian_vacuum") {
-        return RhsSpec{F3D_RHS_CARTESIAN_VACUUM, 7};
+        return RhsSpec{F3D_RHS_CARTESIAN_VACUUM, 7, use_float};
     }
     if (rhs == "boozer_vacuum") {
-        return RhsSpec{F3D_RHS_BOOZER_VACUUM, 6};
+        return RhsSpec{F3D_RHS_BOOZER_VACUUM, 6, use_float};
     }
     if (rhs == "boozer_saw_vacuum") {
-        return RhsSpec{F3D_RHS_BOOZER_SAW_VACUUM, 10};
+        return RhsSpec{F3D_RHS_BOOZER_SAW_VACUUM, 10, use_float};
     }
     if (rhs == "boozer") {
-        return RhsSpec{F3D_RHS_BOOZER, 12};
+        return RhsSpec{F3D_RHS_BOOZER, 12, use_float};
     }
     throw std::invalid_argument("Unsupported rhs: " + rhs);
 }
@@ -191,6 +219,7 @@ extern "C" py::array_t<double> test_gpu_interpolation(
     const RhsSpec rhs_spec = parse_rhs(rhs);
     const int rhs_mode = rhs_spec.mode;
     const int n_fields = rhs_spec.n_fields;
+    const bool use_float = rhs_spec.use_float;
 
     const int x1_count = static_cast<int>(x1_ptr[2]);
     const int x2_count = static_cast<int>(x2_ptr[2]);
@@ -217,46 +246,104 @@ extern "C" py::array_t<double> test_gpu_interpolation(
     constants.x1_count = x1_count;
     constants.x2_count = x2_count;
     constants.x3_count = x3_count;
-    constants.x1_start = x1_ptr[0];
-    constants.x2_start = x2_ptr[0];
-    constants.x2_period = x2_ptr[1];
-    constants.x3_start = x3_ptr[0];
-    constants.x3_period = x3_ptr[1];
-    constants.x1_step = x1_step;
-    constants.x2_step = x2_step;
-    constants.x3_step = x3_step;
+    constants.x1_start = static_cast<float>(x1_ptr[0]);
+    constants.x2_start = static_cast<float>(x2_ptr[0]);
+    constants.x2_period = static_cast<float>(x2_ptr[1]);
+    constants.x3_start = static_cast<float>(x3_ptr[0]);
+    constants.x3_period = static_cast<float>(x3_ptr[1]);
+    constants.x1_step = static_cast<float>(x1_step);
+    constants.x2_step = static_cast<float>(x2_step);
+    constants.x3_step = static_cast<float>(x3_step);
 
     auto& ctx = metal_context();
 
     @autoreleasepool {
-        id<MTLBuffer> quad_m = [ctx.device newBufferWithBytes:quad_ptr length:quad_pts.size() * sizeof(double) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> loc_m = [ctx.device newBufferWithBytes:loc_host.data() length:loc_host.size() * sizeof(double) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> out_m = [ctx.device newBufferWithLength:size_t(n_fields) * size_t(n_points) * sizeof(double) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> c_m = [ctx.device newBufferWithBytes:&constants length:sizeof(constants) options:MTLResourceStorageModeShared];
-
-        id<MTLCommandBuffer> cb = [ctx.queue commandBuffer];
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-        [enc setComputePipelineState:ctx.pipeline];
-        [enc setBuffer:quad_m offset:0 atIndex:0];
-        [enc setBuffer:loc_m offset:0 atIndex:1];
-        [enc setBuffer:out_m offset:0 atIndex:2];
-        [enc setBuffer:c_m offset:0 atIndex:3];
-
+        id<MTLBuffer> c_m = [ctx.device newBufferWithBytes:&constants length:sizeof(constants)
+                                                    options:MTLResourceStorageModeShared];
         const NSUInteger total_threads = static_cast<NSUInteger>(n_points);
-        const NSUInteger threads_per_group = std::min<NSUInteger>(ctx.pipeline.maxTotalThreadsPerThreadgroup, 256);
-        [enc dispatchThreads:MTLSizeMake(total_threads, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1, 1)];
-        [enc endEncoding];
-        [cb commit];
-        [cb waitUntilCompleted];
+        const size_t out_count = size_t(n_fields) * size_t(n_points);
 
-        if (cb.status == MTLCommandBufferStatusError) {
-            std::string err = cb.error ? std::string([[cb.error localizedDescription] UTF8String]) : "unknown";
-            throw std::runtime_error("Metal test_gpu_interpolation dispatch failed: " + err);
+        if (use_float) {
+            std::vector<float> quad_host(quad_pts.size());
+            std::vector<float> loc_host_f(loc_host.size());
+            for (size_t i = 0; i < quad_host.size(); ++i) {
+                quad_host[i] = static_cast<float>(quad_ptr[i]);
+            }
+            for (size_t i = 0; i < loc_host_f.size(); ++i) {
+                loc_host_f[i] = static_cast<float>(loc_host[i]);
+            }
+
+            id<MTLBuffer> quad_m = [ctx.device newBufferWithBytes:quad_host.data()
+                                                            length:quad_host.size() * sizeof(float)
+                                                           options:MTLResourceStorageModeShared];
+            id<MTLBuffer> loc_m = [ctx.device newBufferWithBytes:loc_host_f.data()
+                                                           length:loc_host_f.size() * sizeof(float)
+                                                          options:MTLResourceStorageModeShared];
+            id<MTLBuffer> out_m = [ctx.device newBufferWithLength:out_count * sizeof(float)
+                                                           options:MTLResourceStorageModeShared];
+
+            id<MTLCommandBuffer> cb = [ctx.queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            [enc setComputePipelineState:ctx.pipeline_f32];
+            [enc setBuffer:quad_m offset:0 atIndex:0];
+            [enc setBuffer:loc_m offset:0 atIndex:1];
+            [enc setBuffer:out_m offset:0 atIndex:2];
+            [enc setBuffer:c_m offset:0 atIndex:3];
+
+            const NSUInteger threads_per_group = std::min<NSUInteger>(ctx.pipeline_f32.maxTotalThreadsPerThreadgroup, 256);
+            [enc dispatchThreads:MTLSizeMake(total_threads, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1, 1)];
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+
+            if (cb.status == MTLCommandBufferStatusError) {
+                std::string err = cb.error ? std::string([[cb.error localizedDescription] UTF8String]) : "unknown";
+                throw std::runtime_error("Metal f32 test_gpu_interpolation dispatch failed: " + err);
+            }
+
+            py::array_t<double> result(out_count);
+            py::buffer_info result_buf = result.request();
+            const float* out_ptr = static_cast<const float*>([out_m contents]);
+            double* result_ptr = static_cast<double*>(result_buf.ptr);
+            for (size_t i = 0; i < out_count; ++i) {
+                result_ptr[i] = static_cast<double>(out_ptr[i]);
+            }
+            return result;
+        } else {
+            id<MTLBuffer> quad_m = [ctx.device newBufferWithBytes:quad_ptr
+                                                            length:quad_pts.size() * sizeof(double)
+                                                           options:MTLResourceStorageModeShared];
+            id<MTLBuffer> loc_m = [ctx.device newBufferWithBytes:loc_host.data()
+                                                           length:loc_host.size() * sizeof(double)
+                                                          options:MTLResourceStorageModeShared];
+            id<MTLBuffer> out_m = [ctx.device newBufferWithLength:out_count * sizeof(double)
+                                                           options:MTLResourceStorageModeShared];
+
+            id<MTLCommandBuffer> cb = [ctx.queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            [enc setComputePipelineState:ctx.pipeline_f64];
+            [enc setBuffer:quad_m offset:0 atIndex:0];
+            [enc setBuffer:loc_m offset:0 atIndex:1];
+            [enc setBuffer:out_m offset:0 atIndex:2];
+            [enc setBuffer:c_m offset:0 atIndex:3];
+
+            const NSUInteger threads_per_group = std::min<NSUInteger>(ctx.pipeline_f64.maxTotalThreadsPerThreadgroup, 256);
+            [enc dispatchThreads:MTLSizeMake(total_threads, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1, 1)];
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+
+            if (cb.status == MTLCommandBufferStatusError) {
+                std::string err = cb.error ? std::string([[cb.error localizedDescription] UTF8String]) : "unknown";
+                throw std::runtime_error("Metal f64 test_gpu_interpolation dispatch failed: " + err);
+            }
+
+            py::array_t<double> result(out_count);
+            py::buffer_info result_buf = result.request();
+            std::memcpy(result_buf.ptr, [out_m contents], out_count * sizeof(double));
+            return result;
         }
-
-        py::array_t<double> result(n_fields * n_points);
-        py::buffer_info result_buf = result.request();
-        std::memcpy(result_buf.ptr, [out_m contents], size_t(n_fields) * size_t(n_points) * sizeof(double));
-        return result;
     }
 }

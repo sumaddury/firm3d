@@ -4,6 +4,7 @@ project(firm3dpp)
 
 include(CheckLanguage)
 check_language(CUDA)
+check_language(OBJCXX)
 
 if(CMAKE_CUDA_COMPILER)
     enable_language(CUDA)
@@ -16,6 +17,26 @@ if(CMAKE_CUDA_COMPILER)
 else()
     set(CUDA_TARGETS) 
     message(STATUS "CUDA not found. GPU bindings will be skipped.")
+endif()
+
+if(APPLE AND CMAKE_OBJCXX_COMPILER)
+    enable_language(OBJCXX)
+    add_definitions(-DUSE_METAL)
+    set(METAL_TARGETS src/firm3dpp/metal_wrapper.mm)
+
+    find_library(METAL_FRAMEWORK Metal)
+    find_library(FOUNDATION_FRAMEWORK Foundation)
+    if(METAL_FRAMEWORK AND FOUNDATION_FRAMEWORK)
+        set(METAL_LIBRARIES ${METAL_FRAMEWORK} ${FOUNDATION_FRAMEWORK})
+        message(STATUS "Apple Metal found. Metal bindings will be compiled.")
+    else()
+        message(WARNING "Apple platform detected, but Metal/Foundation frameworks not found. Metal bindings will be skipped.")
+        set(METAL_TARGETS)
+        unset(METAL_LIBRARIES)
+    endif()
+else()
+    set(METAL_TARGETS)
+    message(STATUS "Apple Metal not available. Metal bindings will be skipped.")
 endif()
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -170,6 +191,7 @@ pybind11_add_module(${PROJECT_NAME}
     src/firm3dpp/python_boozermagneticfield.cpp
     src/firm3dpp/boozerradialinterpolant.cpp
     ${CUDA_TARGETS}
+    ${METAL_TARGETS}
     ${GSL_TARGETS}
 )
 
@@ -187,6 +209,10 @@ set_target_properties(${PROJECT_NAME} PROPERTIES COMPILE_FLAGS "-I${Boost_INCLUD
 
 if(OpenMP_CXX_FOUND)
     target_link_libraries(${PROJECT_NAME} PRIVATE OpenMP::OpenMP_CXX)
+endif()
+
+if(METAL_LIBRARIES)
+    target_link_libraries(${PROJECT_NAME} PRIVATE ${METAL_LIBRARIES})
 endif()
 
 IF (GSL_FOUND)
