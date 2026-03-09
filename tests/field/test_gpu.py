@@ -23,7 +23,31 @@ import unittest
 
 from firm3d.field.boozermagneticfield import ShearAlfvenWavesSuperposition
 
-HAS_CUDA = hasattr(firm3dpp, "test_gpu_interpolation")
+# Capability flags per API surface. This allows partial backends (e.g. Metal interpolation only).
+HAS_GPU_INTERPOLATION = hasattr(firm3dpp, "test_gpu_interpolation")
+HAS_GPU_DERIVATIVES = all(
+    hasattr(firm3dpp, name)
+    for name in [
+        "test_derivatives_boozer",
+        "test_derivatives_saw",
+        "test_derivatives_saw_nok",
+    ]
+)
+HAS_GPU_TIMESTEP = all(
+    hasattr(firm3dpp, name)
+    for name in [
+        "test_timestep_boozer",
+        "test_timestep_saw",
+        "test_timestep_saw_nok",
+    ]
+)
+
+# CUDA backend provides the full GPU API today. Metal currently provides interpolation only.
+HAS_CUDA_BACKEND = hasattr(firm3dpp, "boozer_gpu_tracing")
+IS_METAL_BACKEND = HAS_GPU_INTERPOLATION and not HAS_CUDA_BACKEND
+
+# Use looser tolerance for single-precision Metal interpolation.
+INTERP_TOL = 1e-4 if IS_METAL_BACKEND else 1e-8
 
 
 def get_field(boozmn_filename, n_metagrid_pts, vacuum):
@@ -79,7 +103,7 @@ def sample_test_points(n_test_pts):
     stz = np.hstack((s, t, z))
     return stz
 
-def test_interpolant(field, nfp, stz, saw_present=False,tol=1e-8):
+def run_interpolant_check(field, nfp, stz, saw_present=False, tol=1e-8):
     srange, trange, zrange, quad_info, maxJ = construct_interpolant(field, nfp, saw_present=saw_present)
     
     # evaluate interpolants
@@ -156,7 +180,7 @@ def test_interpolant(field, nfp, stz, saw_present=False,tol=1e-8):
 
     return error_is_small
 
-def test_derivatives(field, nfp, stz, vpar, vtotal, psi0, time=None, saw_present=False, saw_filename=None,tol=1e-8):
+def run_derivatives_check(field, nfp, stz, vpar, vtotal, psi0, time=None, saw_present=False, saw_filename=None, tol=1e-8):
 
     srange, trange, zrange, quad_info, maxJ = construct_interpolant(field, nfp)
     ## evaluate derivatives
@@ -328,7 +352,7 @@ def test_derivatives(field, nfp, stz, vpar, vtotal, psi0, time=None, saw_present
 
     return error_is_small
 
-def test_timestep(field, nfp, stz, vpar, vtotal, psi0, time=None, saw_filename=None, tol=1e-8):
+def run_timestep_check(field, nfp, stz, vpar, vtotal, psi0, time=None, saw_filename=None, tol=1e-8):
 
     srange, trange, zrange, quad_info, maxJ = construct_interpolant(field, nfp)
 
@@ -512,7 +536,9 @@ def test_timestep(field, nfp, stz, vpar, vtotal, psi0, time=None, saw_filename=N
 
     return error_is_small
 
-@unittest.skipUnless(HAS_CUDA, "CUDA support not available")
+@unittest.skipUnless(
+    HAS_GPU_INTERPOLATION, "No GPU interpolation backend (neither CUDA nor Metal) available"
+)
 class TestGPUTracing(unittest.TestCase):
     def test_boozer_vacuum(self):
         n_metagrid_pts = 15
@@ -525,20 +551,24 @@ class TestGPUTracing(unittest.TestCase):
         n_test_pts = 10000
         stz = sample_test_points(n_test_pts)
 
-        tol = 1e-8
+        tol = INTERP_TOL
 
         ### test interpolant
-        is_small = test_interpolant(field, nfp, stz, tol=tol)
+        is_small = run_interpolant_check(field, nfp, stz, tol=tol)
         self.assertTrue(is_small)
 
+        if not (HAS_GPU_DERIVATIVES and HAS_GPU_TIMESTEP):
+            return
+
         ### test derivatives
+        tol = 1e-8
         VELOCITY = np.sqrt(2 * ENERGY / MASS)
         vpar_init = np.random.uniform(-VELOCITY, VELOCITY, (n_test_pts,))
-        is_small = test_derivatives(field, nfp, stz, vpar_init, VELOCITY, field.psi0, tol)
+        is_small = run_derivatives_check(field, nfp, stz, vpar_init, VELOCITY, field.psi0, tol=tol)
         self.assertTrue(is_small)
 
         ### test timesteps
-        is_small = test_timestep(field, nfp, stz, vpar_init, VELOCITY, field.psi0, tol)
+        is_small = run_timestep_check(field, nfp, stz, vpar_init, VELOCITY, field.psi0, tol=tol)
         self.assertTrue(is_small)
 
     def test_boozer_finite_beta(self):
@@ -552,20 +582,24 @@ class TestGPUTracing(unittest.TestCase):
         n_test_pts = 10000
         stz = sample_test_points(n_test_pts)
 
-        tol = 1e-8
+        tol = INTERP_TOL
 
         ### test interpolant
-        is_small = test_interpolant(field, nfp, stz, tol)
+        is_small = run_interpolant_check(field, nfp, stz, tol=tol)
         self.assertTrue(is_small)
 
+        if not (HAS_GPU_DERIVATIVES and HAS_GPU_TIMESTEP):
+            return
+
         ### test derivatives
+        tol = 1e-8
         VELOCITY = np.sqrt(2 * ENERGY / MASS)
         vpar_init = np.random.uniform(-VELOCITY, VELOCITY, (n_test_pts,))
-        is_small = test_derivatives(field, nfp, stz, vpar_init, VELOCITY, field.psi0, tol)
+        is_small = run_derivatives_check(field, nfp, stz, vpar_init, VELOCITY, field.psi0, tol=tol)
         self.assertTrue(is_small)
 
         ### test timesteps
-        is_small = test_timestep(field, nfp, stz, vpar_init, VELOCITY, field.psi0, tol)
+        is_small = run_timestep_check(field, nfp, stz, vpar_init, VELOCITY, field.psi0, tol=tol)
         self.assertTrue(is_small)
 
     def test_boozer_vacuum_saw(self):
@@ -589,21 +623,25 @@ class TestGPUTracing(unittest.TestCase):
 
         n_test_pts = 10000
         stz = sample_test_points(n_test_pts)
-        tol = 1e-8
+        tol = INTERP_TOL
 
         ### test interpolant
-        is_small = test_interpolant(saw, nfp, stz, saw_present=True, tol=tol)
+        is_small = run_interpolant_check(saw, nfp, stz, saw_present=True, tol=tol)
         self.assertTrue(is_small)
 
+        if not (HAS_GPU_DERIVATIVES and HAS_GPU_TIMESTEP):
+            return
+
         ## test derivatives
+        tol = 1e-8
         VELOCITY = np.sqrt(2 * ENERGY / MASS)
         vpar_init = np.random.uniform(-VELOCITY, VELOCITY, (n_test_pts,))
         time = np.random.uniform(low=0, high=1e-3, size=(n_test_pts,))
-        is_small = test_derivatives(saw, nfp, stz, vpar_init, VELOCITY, field.psi0, time=time, saw_present=True, saw_filename=saw_filename, tol=tol)
+        is_small = run_derivatives_check(saw, nfp, stz, vpar_init, VELOCITY, field.psi0, time=time, saw_present=True, saw_filename=saw_filename, tol=tol)
         self.assertTrue(is_small)
 
         ### test timesteps
-        is_small = test_timestep(saw, nfp, stz, vpar_init, VELOCITY, field.psi0, time=time, saw_filename=saw_filename, tol=tol)
+        is_small = run_timestep_check(saw, nfp, stz, vpar_init, VELOCITY, field.psi0, time=time, saw_filename=saw_filename, tol=tol)
         self.assertTrue(is_small)
         
     def test_boozer_nok_saw(self):
@@ -627,25 +665,28 @@ class TestGPUTracing(unittest.TestCase):
 
         n_test_pts = 10000
         stz = sample_test_points(n_test_pts)
-        tol = 1e-8
+        tol = INTERP_TOL
 
         ### test interpolant
-        is_small = test_interpolant(saw, nfp, stz, saw_present=True, tol=tol)
+        is_small = run_interpolant_check(saw, nfp, stz, saw_present=True, tol=tol)
         self.assertTrue(is_small)
 
+        if not (HAS_GPU_DERIVATIVES and HAS_GPU_TIMESTEP):
+            return
+
         ## test derivatives
+        tol = 1e-8
         VELOCITY = np.sqrt(2 * ENERGY / MASS)
         vpar_init = np.random.uniform(-VELOCITY, VELOCITY, (n_test_pts,))
         time = np.random.uniform(low=0, high=1e-3, size=(n_test_pts,))
-        is_small = test_derivatives(saw, nfp, stz, vpar_init, VELOCITY, field.psi0, time=time, saw_present=True, saw_filename=saw_filename, tol=tol)
+        is_small = run_derivatives_check(saw, nfp, stz, vpar_init, VELOCITY, field.psi0, time=time, saw_present=True, saw_filename=saw_filename, tol=tol)
         self.assertTrue(is_small)
 
         ### test timesteps
-        is_small = test_timestep(saw, nfp, stz, vpar_init, VELOCITY, field.psi0, time=time, saw_filename=saw_filename, tol=tol)
+        is_small = run_timestep_check(saw, nfp, stz, vpar_init, VELOCITY, field.psi0, time=time, saw_filename=saw_filename, tol=tol)
         self.assertTrue(is_small)
 
 
 if __name__ == "__main__":
     print("Running GPU tracing tests...")
     unittest.main()
-
