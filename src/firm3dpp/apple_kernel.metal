@@ -39,6 +39,46 @@ struct InterpolationTestConstants {
     float x3_step;
 };
 
+struct DerivativeConstants {
+    int x1_count;
+    int x2_count;
+    int x3_count;
+
+    int n_x2;
+    int n_x3;
+    int n_x23;
+    int n_points;
+
+    float x1_start;
+    float x2_start;
+    float x2_period;
+    float x3_start;
+    float x3_period;
+
+    float x1_step;
+    float x2_step;
+    float x3_step;
+
+    float mass;
+    float charge;
+    float psi0;
+    float v_total;
+};
+
+constant float f3d_dp5_wgts[7][7] = {
+    {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f},
+    {1.0f / 5.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f},
+    {3.0f / 40.0f, 9.0f / 40.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f},
+    {44.0f / 45.0f, -56.0f / 15.0f, 32.0f / 9.0f, 0.0f, 0.0f, 0.0f, 0.0f},
+    {19372.0f / 6561.0f, -25360.0f / 2187.0f, 64448.0f / 6561.0f, -212.0f / 729.0f, 0.0f, 0.0f, 0.0f},
+    {9017.0f / 3168.0f, -355.0f / 33.0f, 46732.0f / 5247.0f, 49.0f / 176.0f, -5103.0f / 18656.0f, 0.0f, 0.0f},
+    {35.0f / 384.0f, 0.0f, 500.0f / 1113.0f, 125.0f / 192.0f, -2187.0f / 6784.0f, 11.0f / 84.0f, 0.0f}
+};
+
+constant float f3d_dp5_t_wgts[7] = {
+    0.0f, 1.0f / 5.0f, 3.0f / 10.0f, 4.0f / 5.0f, 8.0f / 9.0f, 1.0f, 1.0f
+};
+
 inline float f3d_shape_fn(float x, int i) {
     switch (i) {
         case 0:
@@ -60,6 +100,163 @@ inline float f3d_positive_mod(float x, float period) {
         out += period;
     }
     return out;
+}
+
+template <int kRhsMode>
+inline void f3d_map_to_grid(
+    thread float3& interp_pt,
+    thread float* x_temp,
+    thread bool& symmetry_exploited,
+    constant DerivativeConstants& c
+) {
+    const float two_pi = 6.28318530717958647692f;
+
+    float x = x_temp[1];
+    float y = x_temp[2];
+    float z = x_temp[3];
+
+    float r = sqrt(x * x + y * y);
+    float phi = atan2(y, x);
+    phi = f3d_positive_mod(phi, c.x2_period);
+
+    symmetry_exploited = z < 0.0f;
+    if (symmetry_exploited) {
+        z = -z;
+        phi = f3d_positive_mod(two_pi - phi, c.x2_period);
+    }
+
+    interp_pt = float3(r, phi, z);
+}
+
+template <>
+inline void f3d_map_to_grid<F3D_RHS_BOOZER_VACUUM>(
+    thread float3& interp_pt,
+    thread float* x_temp,
+    thread bool& symmetry_exploited,
+    constant DerivativeConstants& c
+) {
+    const float pi = 3.14159265358979323846f;
+    const float two_pi = 6.28318530717958647692f;
+
+    float x1 = x_temp[1];
+    float x2 = x_temp[2];
+    float zeta = x_temp[3];
+
+    float s = sqrt(x1 * x1 + x2 * x2);
+    float theta = atan2(x2, x1);
+    float t = f3d_positive_mod(theta, two_pi);
+    zeta = f3d_positive_mod(zeta, c.x3_period);
+
+    symmetry_exploited = t > pi;
+    if (symmetry_exploited) {
+        zeta = c.x3_period - zeta;
+        t = two_pi - t;
+    }
+
+    interp_pt = float3(s, t, zeta);
+}
+
+template <int kRhsMode>
+inline void f3d_build_state(
+    thread float* x_temp,
+    int deriv_id,
+    thread bool* symmetry_exploited,
+    thread int* index_i,
+    thread int* index_j,
+    thread int* index_k,
+    thread float* x1_shape,
+    thread float* x2_shape,
+    thread float* x3_shape,
+    thread float* state,
+    thread float* derivs,
+    thread float* t,
+    thread float* dt,
+    constant DerivativeConstants& c
+) {
+    x_temp[0] = t[0] + f3d_dp5_t_wgts[deriv_id] * dt[0];
+    for (int i = 0; i < 4; ++i) {
+        x_temp[i + 1] = state[i];
+    }
+
+    for (int j = 0; j < deriv_id; ++j) {
+        for (int i = 0; i < 4; ++i) {
+            x_temp[i + 1] += dt[0] * f3d_dp5_wgts[deriv_id][j] * derivs[6 * j + i];
+        }
+    }
+
+    float3 interp_pt;
+    bool sym = false;
+    f3d_map_to_grid<kRhsMode>(interp_pt, x_temp, sym, c);
+    symmetry_exploited[0] = sym;
+
+    float x1 = interp_pt.x;
+    float x2 = interp_pt.y;
+    float x3 = interp_pt.z;
+
+    int i = 3 * (int((x1 - c.x1_start) / c.x1_step) / 3);
+    int j = 3 * (int((x2 - c.x2_start) / c.x2_step) / 3);
+    int k = 3 * (int((x3 - c.x3_start) / c.x3_step) / 3);
+
+    i = min(i, c.x1_count - 4);
+    j = min(j, c.x2_count - 4);
+    k = min(k, c.x3_count - 4);
+    i = max(i, 0);
+    j = max(j, 0);
+    k = max(k, 0);
+
+    float x1_rel = (x1 - float(i) * c.x1_step - c.x1_start) / c.x1_step;
+    float x2_rel = (x2 - float(j) * c.x2_step - c.x2_start) / c.x2_step;
+    float x3_rel = (x3 - float(k) * c.x3_step - c.x3_start) / c.x3_step;
+
+    for (int ii = 0; ii < 4; ++ii) {
+        x1_shape[ii] = f3d_shape_fn(x1_rel, ii);
+        x2_shape[ii] = f3d_shape_fn(x2_rel, ii);
+        x3_shape[ii] = f3d_shape_fn(x3_rel, ii);
+    }
+
+    index_i[0] = i / 3;
+    index_j[0] = j / 3;
+    index_k[0] = k / 3;
+}
+
+template <int kRhsMode>
+inline void f3d_calc_derivs(
+    device const float* quad_pts,
+    thread float* derivs,
+    int deriv_id,
+    thread float* x_temp,
+    thread bool* symmetry_exploited,
+    thread int* index_i,
+    thread int* index_j,
+    thread int* index_k,
+    thread float* x1_shape,
+    thread float* x2_shape,
+    thread float* x3_shape,
+    thread float* mu,
+    int nparticles_blk,
+    constant DerivativeConstants& c
+) {
+    //
+}
+
+template <>
+inline void f3d_calc_derivs<F3D_RHS_BOOZER_VACUUM>(
+    device const float* quad_pts,
+    thread float* derivs,
+    int deriv_id,
+    thread float* x_temp,
+    thread bool* symmetry_exploited,
+    thread int* index_i,
+    thread int* index_j,
+    thread int* index_k,
+    thread float* x1_shape,
+    thread float* x2_shape,
+    thread float* x3_shape,
+    thread float* mu,
+    int nparticles_blk,
+    constant DerivativeConstants& c
+) {
+    //
 }
 
 kernel void apple_interpolate_kernel(
