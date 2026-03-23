@@ -214,9 +214,6 @@ inline void f3d_build_state(
     index_k[0] = k / 3;
 }
 
-// 4×4×4 tricubic interpolation for n_fields output values.
-// Precomputes all 64 shape weights once (reducing multiplications in the accumulation loop
-// from 3 per step to 1), then walks the data pointer linearly (addition, not multiplication).
 inline void f3d_interpolate(
     device const float* quad_pts,
     thread float* interp,
@@ -253,7 +250,6 @@ inline void f3d_interpolate(
     }
 }
 
-// Default template: no-op (only specializations should be called).
 template <int kRhsMode>
 inline void f3d_calc_derivs(
     device const float* quad_pts,
@@ -302,29 +298,28 @@ inline void f3d_calc_derivs<F3D_RHS_BOOZER_VACUUM>(
                     c.n_x23, c.n_x3, 6,
                     x1_shape, x2_shape, x3_shape);
 
-    float modB        = interp[0];
-    float dmodBds     = interp[1];
+    float modB = interp[0];
+    float dmodBds = interp[1];
     float dmodBdtheta = interp[2];
-    float dmodBdzeta  = interp[3];
-    float G           = interp[4];
-    float iota        = interp[5];
+    float dmodBdzeta = interp[3];
+    float G = interp[4];
+    float iota = interp[5];
 
-    // dmodBdtheta and dmodBdzeta are odd under stellarator symmetry.
     if (symmetry_exploited[0]) {
         dmodBdtheta *= -1.0f;
         dmodBdzeta  *= -1.0f;
     }
 
-    float x1    = x_temp[1];
-    float x2    = x_temp[2];
-    float s     = sqrt(x1 * x1 + x2 * x2);
+    float x1 = x_temp[1];
+    float x2 = x_temp[2];
+    float s = sqrt(x1 * x1 + x2 * x2);
     float theta = atan2(x2, x1);
     float v_par = x_temp[4];
     float mu_val = mu[0];
 
     float fak1 = c.mass * v_par * v_par / modB + c.mass * mu_val;
     float sdot = -dmodBdtheta * fak1 / (c.charge * c.psi0);
-    float tdot =  dmodBds    * fak1 / (c.charge * c.psi0) + iota * v_par * modB / G;
+    float tdot = dmodBds * fak1 / (c.charge * c.psi0) + iota * v_par * modB / G;
 
     derivs[6 * deriv_id + 0] = sdot * cos(theta) - s * sin(theta) * tdot;
     derivs[6 * deriv_id + 1] = sdot * sin(theta) + s * cos(theta) * tdot;
@@ -371,7 +366,6 @@ kernel void test_gpu_derivs_kernel(
     float mu[1];
     float t[1], dt[1];
 
-    // --- Phase 1: dummy call at t=0 to retrieve modB and compute mu ---
     t[0]  = 0.0f;
     dt[0] = 0.0f;
     f3d_build_state<F3D_RHS_BOOZER_VACUUM>(
@@ -380,7 +374,7 @@ kernel void test_gpu_derivs_kernel(
         x1_shape, x2_shape, x3_shape,
         state, derivs, t, dt, c);
 
-    mu[0] = -1.0f;  // dummy: only derivs[4] = modB is needed
+    mu[0] = -1.0f;
     f3d_calc_derivs<F3D_RHS_BOOZER_VACUUM>(
         quad_pts, derivs, 0,
         x_temp, symmetry_exploited,
@@ -392,7 +386,6 @@ kernel void test_gpu_derivs_kernel(
     float v_perp2 = c.v_total * c.v_total - vpar_val * vpar_val;
     mu[0] = v_perp2 / (2.0f * modB);
 
-    // --- Phase 2: real call at actual time with correct mu ---
     t[0]  = time_buf[p];
     dt[0] = 0.0f;
     f3d_build_state<F3D_RHS_BOOZER_VACUUM>(
