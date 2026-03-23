@@ -47,10 +47,37 @@ struct InterpolationTestConstants {
     float x3_step;
 };
 
+struct DerivativeConstants {
+    int x1_count;
+    int x2_count;
+    int x3_count;
+
+    int n_x2;
+    int n_x3;
+    int n_x23;
+    int n_points;
+
+    float x1_start;
+    float x2_start;
+    float x2_period;
+    float x3_start;
+    float x3_period;
+
+    float x1_step;
+    float x2_step;
+    float x3_step;
+
+    float mass;
+    float charge;
+    float psi0;
+    float v_total;
+};
+
 struct MetalContext {
     id<MTLDevice> device = nil;
     id<MTLCommandQueue> queue = nil;
     id<MTLComputePipelineState> pipeline_f32 = nil;
+    id<MTLComputePipelineState> pipeline_derivs = nil;
 };
 
 std::string load_file(const std::string& path) {
@@ -128,6 +155,7 @@ MetalContext& metal_context() {
             }
 
             local.pipeline_f32 = create_pipeline_state(local.device, lib, @"test_gpu_interpolation_kernel");
+            local.pipeline_derivs = create_pipeline_state(local.device, lib, @"test_gpu_derivs_kernel");
         }
         return local;
     }();
@@ -187,6 +215,121 @@ void preprocess_loc_for_cuda_compat(std::vector<double>& loc, int rhs_mode, int 
     }
 }
 
+}
+
+extern "C" py::array_t<double> test_gpu_derivatives_boozer_vacuum(
+    py::array_t<double> quad_pts,
+    py::array_t<double> x1_range,
+    py::array_t<double> x2_range,
+    py::array_t<double> x3_range,
+    py::array_t<double> loc,
+    py::array_t<double> vpar,
+    py::array_t<double> time,
+    double v_total, double m, double q, double psi0,
+    int n_points
+) {
+    double* x1_ptr   = static_cast<double*>(x1_range.request().ptr);
+    double* x2_ptr   = static_cast<double*>(x2_range.request().ptr);
+    double* x3_ptr   = static_cast<double*>(x3_range.request().ptr);
+    double* quad_ptr = static_cast<double*>(quad_pts.request().ptr);
+    double* loc_ptr  = static_cast<double*>(loc.request().ptr);
+    double* vpar_ptr = static_cast<double*>(vpar.request().ptr);
+    double* time_ptr = static_cast<double*>(time.request().ptr);
+
+    const int x1_count = static_cast<int>(x1_ptr[2]);
+    const int x2_count = static_cast<int>(x2_ptr[2]);
+    const int x3_count = static_cast<int>(x3_ptr[2]);
+    const double x1_step = (x1_ptr[1] - x1_ptr[0]) / (x1_ptr[2] - 1.0);
+    const double x2_step = (x2_ptr[1] - x2_ptr[0]) / (x2_ptr[2] - 1.0);
+    const double x3_step = (x3_ptr[1] - x3_ptr[0]) / (x3_ptr[2] - 1.0);
+    const int n_x2  = (x2_count - 1) / 3;
+    const int n_x3  = (x3_count - 1) / 3;
+    const int n_x23 = n_x2 * n_x3;
+
+    DerivativeConstants dc{};
+    dc.x1_count  = x1_count;
+    dc.x2_count  = x2_count;
+    dc.x3_count  = x3_count;
+    dc.n_x2      = n_x2;
+    dc.n_x3      = n_x3;
+    dc.n_x23     = n_x23;
+    dc.n_points  = n_points;
+    dc.x1_start  = static_cast<float>(x1_ptr[0]);
+    dc.x2_start  = static_cast<float>(x2_ptr[0]);
+    dc.x2_period = static_cast<float>(x2_ptr[1]);
+    dc.x3_start  = static_cast<float>(x3_ptr[0]);
+    dc.x3_period = static_cast<float>(x3_ptr[1]);
+    dc.x1_step   = static_cast<float>(x1_step);
+    dc.x2_step   = static_cast<float>(x2_step);
+    dc.x3_step   = static_cast<float>(x3_step);
+    dc.mass      = static_cast<float>(m);
+    dc.charge    = static_cast<float>(q);
+    dc.psi0      = static_cast<float>(psi0);
+    dc.v_total   = static_cast<float>(v_total);
+
+    std::vector<float> quad_f(quad_pts.size());
+    std::vector<float> loc_f(loc.size());
+    std::vector<float> vpar_f(n_points);
+    std::vector<float> time_f(n_points);
+    for (size_t i = 0; i < quad_f.size(); ++i) quad_f[i] = static_cast<float>(quad_ptr[i]);
+    for (size_t i = 0; i < loc_f.size(); ++i)  loc_f[i]  = static_cast<float>(loc_ptr[i]);
+    for (int i = 0; i < n_points; ++i)          vpar_f[i] = static_cast<float>(vpar_ptr[i]);
+    for (int i = 0; i < n_points; ++i)          time_f[i] = static_cast<float>(time_ptr[i]);
+
+    auto& ctx = metal_context();
+    const size_t out_count = 4 * static_cast<size_t>(n_points);
+
+    @autoreleasepool {
+        id<MTLBuffer> quad_m = [ctx.device newBufferWithBytes:quad_f.data()
+                                                        length:quad_f.size() * sizeof(float)
+                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> loc_m  = [ctx.device newBufferWithBytes:loc_f.data()
+                                                        length:loc_f.size() * sizeof(float)
+                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> vpar_m = [ctx.device newBufferWithBytes:vpar_f.data()
+                                                        length:vpar_f.size() * sizeof(float)
+                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> time_m = [ctx.device newBufferWithBytes:time_f.data()
+                                                        length:time_f.size() * sizeof(float)
+                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> out_m  = [ctx.device newBufferWithLength:out_count * sizeof(float)
+                                                        options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dc_m   = [ctx.device newBufferWithBytes:&dc
+                                                        length:sizeof(dc)
+                                                       options:MTLResourceStorageModeShared];
+
+        id<MTLCommandBuffer>       cb  = [ctx.queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:ctx.pipeline_derivs];
+        [enc setBuffer:quad_m offset:0 atIndex:0];
+        [enc setBuffer:loc_m  offset:0 atIndex:1];
+        [enc setBuffer:vpar_m offset:0 atIndex:2];
+        [enc setBuffer:time_m offset:0 atIndex:3];
+        [enc setBuffer:out_m  offset:0 atIndex:4];
+        [enc setBuffer:dc_m   offset:0 atIndex:5];
+
+        const NSUInteger total_threads = static_cast<NSUInteger>(n_points);
+        const NSUInteger tpg = std::min<NSUInteger>(ctx.pipeline_derivs.maxTotalThreadsPerThreadgroup, 256);
+        [enc dispatchThreads:MTLSizeMake(total_threads, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+
+        if (cb.status == MTLCommandBufferStatusError) {
+            std::string err = cb.error
+                ? std::string([[cb.error localizedDescription] UTF8String]) : "unknown";
+            throw std::runtime_error("test_gpu_derivatives_boozer_vacuum dispatch failed: " + err);
+        }
+
+        py::array_t<double> result(out_count);
+        const float*  out_ptr    = static_cast<const float*>([out_m contents]);
+        double*       result_ptr = static_cast<double*>(result.request().ptr);
+        for (size_t i = 0; i < out_count; ++i) {
+            result_ptr[i] = static_cast<double>(out_ptr[i]);
+        }
+        return result;
+    }
 }
 
 extern "C" py::array_t<double> test_gpu_interpolation(

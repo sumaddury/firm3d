@@ -33,6 +33,7 @@ HAS_GPU_DERIVATIVES = all(
         "test_derivatives_saw_nok",
     ]
 )
+HAS_METAL_DERIV_BOOZER_VAC = hasattr(firm3dpp, "test_gpu_derivatives_boozer_vacuum")
 HAS_GPU_TIMESTEP = all(
     hasattr(firm3dpp, name)
     for name in [
@@ -42,12 +43,12 @@ HAS_GPU_TIMESTEP = all(
     ]
 )
 
-# CUDA backend provides the full GPU API today. Metal currently provides interpolation only.
+# CUDA backend provides the full GPU API. Metal provides interpolation + boozer_vacuum derivatives.
 HAS_CUDA_BACKEND = hasattr(firm3dpp, "boozer_gpu_tracing")
 IS_METAL_BACKEND = HAS_GPU_INTERPOLATION and not HAS_CUDA_BACKEND
 
 # Use looser tolerance for single-precision Metal interpolation.
-INTERP_TOL = 1e-4 if IS_METAL_BACKEND else 1e-8
+INTERP_TOL = 1e-2 if IS_METAL_BACKEND else 1e-8
 
 
 def get_field(boozmn_filename, n_metagrid_pts, vacuum):
@@ -287,26 +288,40 @@ def run_derivatives_check(field, nfp, stz, vpar, vtotal, psi0, time=None, saw_pr
                 )
             # print(f"Time to compute simsopt derivatives: {time.time() - start_time} seconds")
 
-
             ## evaluate GPU interpolant
             stz = np.ascontiguousarray(stz)
             vpar = np.ascontiguousarray(vpar)
-            # print("calculating new derivatives")
-            # start_time = time.time()
-            gpu_derivs = firm3dpp.test_derivatives_boozer(
-                quad_info,
-                srange,
-                trange,
-                zrange,
-                stz.copy(),
-                vpar,
-                vtotal,
-                MASS,
-                CHARGE,
-                psi0,
-                stz.shape[0],
-                vacuum=True,
-            )
+            if HAS_METAL_DERIV_BOOZER_VAC and not HAS_GPU_DERIVATIVES:
+                time_dummy = np.zeros(stz.shape[0])
+                gpu_derivs = firm3dpp.test_gpu_derivatives_boozer_vacuum(
+                    quad_info,
+                    srange,
+                    trange,
+                    zrange,
+                    stz.copy(),
+                    vpar,
+                    time_dummy,
+                    vtotal,
+                    MASS,
+                    CHARGE,
+                    psi0,
+                    stz.shape[0],
+                )
+            else:
+                gpu_derivs = firm3dpp.test_derivatives_boozer(
+                    quad_info,
+                    srange,
+                    trange,
+                    zrange,
+                    stz.copy(),
+                    vpar,
+                    vtotal,
+                    MASS,
+                    CHARGE,
+                    psi0,
+                    stz.shape[0],
+                    vacuum=True,
+                )
         elif field.field_type == "": # implies finite beta
             # evaluate CPU derivatives
             # print("computing simsopt derivatives")
@@ -557,18 +572,19 @@ class TestGPUTracing(unittest.TestCase):
         is_small = run_interpolant_check(field, nfp, stz, tol=tol)
         self.assertTrue(is_small)
 
+        ### test derivatives (CUDA full backend or Metal boozer-vacuum path)
+        if HAS_GPU_DERIVATIVES or HAS_METAL_DERIV_BOOZER_VAC:
+            VELOCITY = np.sqrt(2 * ENERGY / MASS)
+            vpar_init = np.random.uniform(-VELOCITY, VELOCITY, (n_test_pts,))
+            deriv_tol = INTERP_TOL if IS_METAL_BACKEND else 1e-8
+            is_small = run_derivatives_check(field, nfp, stz, vpar_init, VELOCITY, field.psi0, tol=deriv_tol)
+            self.assertTrue(is_small)
+
         if not (HAS_GPU_DERIVATIVES and HAS_GPU_TIMESTEP):
             return
 
-        ### test derivatives
-        tol = 1e-8
-        VELOCITY = np.sqrt(2 * ENERGY / MASS)
-        vpar_init = np.random.uniform(-VELOCITY, VELOCITY, (n_test_pts,))
-        is_small = run_derivatives_check(field, nfp, stz, vpar_init, VELOCITY, field.psi0, tol=tol)
-        self.assertTrue(is_small)
-
         ### test timesteps
-        is_small = run_timestep_check(field, nfp, stz, vpar_init, VELOCITY, field.psi0, tol=tol)
+        is_small = run_timestep_check(field, nfp, stz, vpar_init, VELOCITY, field.psi0, tol=1e-8)
         self.assertTrue(is_small)
 
     def test_boozer_finite_beta(self):

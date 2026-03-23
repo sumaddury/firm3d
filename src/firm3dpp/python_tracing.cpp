@@ -14,6 +14,20 @@ using std::vector;
 extern "C" py::array_t<double> test_gpu_interpolation(py::array_t<double> quad_pts, py::array_t<double> srange, py::array_t<double> trange, py::array_t<double> zrange, py::array_t<double> loc, std::string coordinates, int n_points);
 #endif
 
+#ifdef USE_METAL
+extern "C" py::array_t<double> test_gpu_derivatives_boozer_vacuum(
+    py::array_t<double> quad_pts,
+    py::array_t<double> x1_range,
+    py::array_t<double> x2_range,
+    py::array_t<double> x3_range,
+    py::array_t<double> loc,
+    py::array_t<double> vpar,
+    py::array_t<double> time,
+    double v_total, double m, double q, double psi0,
+    int n_points
+);
+#endif
+
 #ifdef USE_CUDA
 extern "C" vector<double> cartesian_gpu_tracing(py::array_t<double> quad_pts, py::array_t<double> srange,
         py::array_t<double> trange, py::array_t<double> zrange, py::array_t<double> stz_init, double m, double q, double vtotal, py::array_t<double> vtang, 
@@ -142,6 +156,44 @@ void init_tracing(py::module_ &m){
         py::arg("n_points")
         );
 #endif
+
+#ifdef USE_METAL
+    m.def("test_gpu_derivatives_boozer_vacuum", &test_gpu_derivatives_boozer_vacuum,
+        py::arg("quad_pts"),
+        py::arg("x1_range"),
+        py::arg("x2_range"),
+        py::arg("x3_range"),
+        py::arg("loc"),
+        py::arg("vpar"),
+        py::arg("time"),
+        py::arg("v_total"),
+        py::arg("m"),
+        py::arg("q"),
+        py::arg("psi0"),
+        py::arg("n_points")
+        );
+#endif
+
+    m.def("simsopt_derivs_boozer", &simsopt_derivs_boozer,
+        py::arg("field"),
+        py::arg("loc"),
+        py::arg("m"),
+        py::arg("q"),
+        py::arg("vtotal"),
+        py::arg("vtang"),
+        py::arg("vacuum")
+        );
+
+    m.def("simsopt_derivs_saw", &simsopt_derivs_saw,
+        py::arg("perturbed_field"),
+        py::arg("loc"),
+        py::arg("m"),
+        py::arg("q"),
+        py::arg("vtotal"),
+        py::arg("vtang"),
+        py::arg("time"),
+        py::arg("rhs")
+        );
 
 #ifdef USE_CUDA
     m.def("cartesian_gpu_tracing", &cartesian_gpu_tracing,
@@ -292,28 +344,6 @@ void init_tracing(py::module_ &m){
         py::arg("psi0"),
         py::arg("n_points")
     );
-
-    m.def("simsopt_derivs_boozer", &simsopt_derivs_boozer,
-        py::arg("field"),
-        py::arg("loc"),
-        py::arg("m"),
-        py::arg("q"),
-        py::arg("vtotal"),
-        py::arg("vtang"),
-        py::arg("vacuum")
-        );
-    
-    m.def("simsopt_derivs_saw", &simsopt_derivs_saw,
-        py::arg("perturbed_field"),
-        py::arg("loc"),
-        py::arg("m"),
-        py::arg("q"),
-        py::arg("vtotal"),
-        py::arg("vtang"),
-        py::arg("time"),
-        py::arg("rhs")    
-        );
-
 
     m.def("test_timestep_cartesian", &test_timestep_cartesian,
         py::arg("quad_pts"),

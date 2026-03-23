@@ -1,19 +1,14 @@
 #include <metal_stdlib>
 using namespace metal;
 
+// python -m pip install -e . --no-build-isolation
+// python -m pytest tests/field/test_gpu.py -v
+
 enum {
     F3D_RHS_CARTESIAN_VACUUM = 0,
     F3D_RHS_BOOZER_VACUUM = 1,
     F3D_RHS_BOOZER_SAW_VACUUM = 2,
     F3D_RHS_BOOZER = 3
-};
-
-struct TracingConstants {
-    int n_x2;
-    int n_x3;
-    int n_x23;
-    int n_fields;
-    int n_points;
 };
 
 struct InterpolationTestConstants {
@@ -219,6 +214,46 @@ inline void f3d_build_state(
     index_k[0] = k / 3;
 }
 
+// 4×4×4 tricubic interpolation for n_fields output values.
+// Precomputes all 64 shape weights once (reducing multiplications in the accumulation loop
+// from 3 per step to 1), then walks the data pointer linearly (addition, not multiplication).
+inline void f3d_interpolate(
+    device const float* quad_pts,
+    thread float* interp,
+    int ci, int cj, int ck,
+    int n_x23, int n_x3, int n_fields,
+    thread const float* x1_shape,
+    thread const float* x2_shape,
+    thread const float* x3_shape
+) {
+    float w[64];
+    thread float* wp = w;
+    for (int ii = 0; ii < 4; ++ii) {
+        float s1 = x1_shape[ii];
+        for (int jj = 0; jj < 4; ++jj) {
+            float s12 = s1 * x2_shape[jj];
+            *wp++ = s12 * x3_shape[0];
+            *wp++ = s12 * x3_shape[1];
+            *wp++ = s12 * x3_shape[2];
+            *wp++ = s12 * x3_shape[3];
+        }
+    }
+
+    for (int zz = 0; zz < n_fields; ++zz) {
+        interp[zz] = 0.0f;
+    }
+
+    device const float* dp = quad_pts + n_fields * 64 * (ci * n_x23 + cj * n_x3 + ck);
+    for (int idx = 0; idx < 64; ++idx) {
+        float wt = w[idx];
+        for (int zz = 0; zz < n_fields; ++zz) {
+            interp[zz] += dp[zz] * wt;
+        }
+        dp += n_fields;
+    }
+}
+
+// Default template: no-op (only specializations should be called).
 template <int kRhsMode>
 inline void f3d_calc_derivs(
     device const float* quad_pts,
@@ -235,10 +270,15 @@ inline void f3d_calc_derivs(
     thread float* mu,
     int nparticles_blk,
     constant DerivativeConstants& c
-) {
-    //
-}
+) {}
 
+// Guiding-center vacuum Boozer RHS.
+// State layout in x_temp: [t, x1, x2, zeta, v_par]
+//   where x1 = sqrt(s)*cos(theta), x2 = sqrt(s)*sin(theta).
+// Quad-pts field layout: [modB, dmodBds, dmodBdtheta, dmodBdzeta, G, iota] (6 fields).
+// Derivs layout: derivs[6*deriv_id + i], i in 0..5.
+//   0: dx1/dt   1: dx2/dt   2: dzeta/dt   3: dv_par/dt
+//   4: modB (for mu)   5: G (diagnostic)
 template <>
 inline void f3d_calc_derivs<F3D_RHS_BOOZER_VACUUM>(
     device const float* quad_pts,
@@ -256,46 +296,122 @@ inline void f3d_calc_derivs<F3D_RHS_BOOZER_VACUUM>(
     int nparticles_blk,
     constant DerivativeConstants& c
 ) {
-    //
+    float interp[6];
+    f3d_interpolate(quad_pts, interp,
+                    index_i[0], index_j[0], index_k[0],
+                    c.n_x23, c.n_x3, 6,
+                    x1_shape, x2_shape, x3_shape);
+
+    float modB        = interp[0];
+    float dmodBds     = interp[1];
+    float dmodBdtheta = interp[2];
+    float dmodBdzeta  = interp[3];
+    float G           = interp[4];
+    float iota        = interp[5];
+
+    // dmodBdtheta and dmodBdzeta are odd under stellarator symmetry.
+    if (symmetry_exploited[0]) {
+        dmodBdtheta *= -1.0f;
+        dmodBdzeta  *= -1.0f;
+    }
+
+    float x1    = x_temp[1];
+    float x2    = x_temp[2];
+    float s     = sqrt(x1 * x1 + x2 * x2);
+    float theta = atan2(x2, x1);
+    float v_par = x_temp[4];
+    float mu_val = mu[0];
+
+    float fak1 = c.mass * v_par * v_par / modB + c.mass * mu_val;
+    float sdot = -dmodBdtheta * fak1 / (c.charge * c.psi0);
+    float tdot =  dmodBds    * fak1 / (c.charge * c.psi0) + iota * v_par * modB / G;
+
+    derivs[6 * deriv_id + 0] = sdot * cos(theta) - s * sin(theta) * tdot;
+    derivs[6 * deriv_id + 1] = sdot * sin(theta) + s * cos(theta) * tdot;
+    derivs[6 * deriv_id + 2] = v_par * modB / G;
+    derivs[6 * deriv_id + 3] = -(iota * dmodBdtheta + dmodBdzeta) * mu_val * modB / G;
+    derivs[6 * deriv_id + 4] = modB;
+    derivs[6 * deriv_id + 5] = G;
 }
 
-kernel void apple_interpolate_kernel(
-    device const float* data [[buffer(0)]],
-    device const int* index_i [[buffer(1)]],
-    device const int* index_j [[buffer(2)]],
-    device const int* index_k [[buffer(3)]],
-    device const float* x1_shape [[buffer(4)]],
-    device const float* x2_shape [[buffer(5)]],
-    device const float* x3_shape [[buffer(6)]],
-    device float* out [[buffer(7)]],
-    constant TracingConstants& c [[buffer(8)]],
+// One thread per particle. Runs the two-phase setup (dummy call to get modB → compute mu,
+// then real call at the given time) and writes the first 4 derivatives to out.
+// Only the F3D_RHS_BOOZER_VACUUM physics are wired in; other modes would need
+// additional specialisations of f3d_build_state / f3d_calc_derivs.
+kernel void test_gpu_derivs_kernel(
+    device const float* quad_pts [[buffer(0)]],
+    device const float* loc      [[buffer(1)]],  // (s, theta, zeta) per particle, 3 floats each
+    device const float* vpar_buf [[buffer(2)]],
+    device const float* time_buf [[buffer(3)]],
+    device float*       out      [[buffer(4)]],  // 4 floats per particle: dx1/dt, dx2/dt, dzeta/dt, dvpar/dt
+    constant DerivativeConstants& c [[buffer(5)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    int total = c.n_points * c.n_fields;
-    if (int(gid) >= total) {
-        return;
-    }
+    int p = int(gid);
+    if (p >= c.n_points) return;
 
-    int particle_id = int(gid) / c.n_fields;
-    int zz = int(gid) % c.n_fields;
-    int i = index_i[particle_id];
-    int j = index_j[particle_id];
-    int k = index_k[particle_id];
+    float s_val    = loc[3 * p + 0];
+    float theta    = loc[3 * p + 1];
+    float zeta     = loc[3 * p + 2];
+    float vpar_val = vpar_buf[p];
 
-    float local_val = 0.0f;
-    for (int ii = 0; ii < 4; ++ii) {
-        for (int jj = 0; jj < 4; ++jj) {
-            for (int kk = 0; kk < 4; ++kk) {
-                int row_idx = 64 * (i * c.n_x23 + j * c.n_x3 + k) + 16 * ii + 4 * jj + kk;
-                float shape_val =
-                    x1_shape[ii * c.n_points + particle_id] *
-                    x2_shape[jj * c.n_points + particle_id] *
-                    x3_shape[kk * c.n_points + particle_id];
-                local_val += data[c.n_fields * row_idx + zz] * shape_val;
-            }
-        }
-    }
-    out[particle_id * c.n_fields + zz] = local_val;
+    // State encoding: (x1, x2, zeta, vpar) where x1 = s*cos(theta), x2 = s*sin(theta).
+    float state[4] = {
+        s_val * cos(theta),
+        s_val * sin(theta),
+        zeta,
+        vpar_val
+    };
+
+    float x_temp[5];
+    float derivs[42];   // 7 stages * 6 fields
+    float x1_shape[4], x2_shape[4], x3_shape[4];
+    bool  symmetry_exploited[1];
+    int   index_i[1], index_j[1], index_k[1];
+    float mu[1];
+    float t[1], dt[1];
+
+    // --- Phase 1: dummy call at t=0 to retrieve modB and compute mu ---
+    t[0]  = 0.0f;
+    dt[0] = 0.0f;
+    f3d_build_state<F3D_RHS_BOOZER_VACUUM>(
+        x_temp, 0, symmetry_exploited,
+        index_i, index_j, index_k,
+        x1_shape, x2_shape, x3_shape,
+        state, derivs, t, dt, c);
+
+    mu[0] = -1.0f;  // dummy: only derivs[4] = modB is needed
+    f3d_calc_derivs<F3D_RHS_BOOZER_VACUUM>(
+        quad_pts, derivs, 0,
+        x_temp, symmetry_exploited,
+        index_i, index_j, index_k,
+        x1_shape, x2_shape, x3_shape,
+        mu, 0, c);
+
+    float modB    = derivs[4];
+    float v_perp2 = c.v_total * c.v_total - vpar_val * vpar_val;
+    mu[0] = v_perp2 / (2.0f * modB);
+
+    // --- Phase 2: real call at actual time with correct mu ---
+    t[0]  = time_buf[p];
+    dt[0] = 0.0f;
+    f3d_build_state<F3D_RHS_BOOZER_VACUUM>(
+        x_temp, 0, symmetry_exploited,
+        index_i, index_j, index_k,
+        x1_shape, x2_shape, x3_shape,
+        state, derivs, t, dt, c);
+
+    f3d_calc_derivs<F3D_RHS_BOOZER_VACUUM>(
+        quad_pts, derivs, 0,
+        x_temp, symmetry_exploited,
+        index_i, index_j, index_k,
+        x1_shape, x2_shape, x3_shape,
+        mu, 0, c);
+
+    out[4 * p + 0] = derivs[0];
+    out[4 * p + 1] = derivs[1];
+    out[4 * p + 2] = derivs[2];
+    out[4 * p + 3] = derivs[3];
 }
 
 kernel void test_gpu_interpolation_kernel(
@@ -377,17 +493,13 @@ kernel void test_gpu_interpolation_kernel(
         s3[ii] = f3d_shape_fn(x3_rel, ii);
     }
 
+    float interp[12];
+    f3d_interpolate(quad_pts, interp,
+                    cell_i, cell_j, cell_k,
+                    c.n_x23, c.n_x3, c.n_fields,
+                    s1, s2, s3);
     for (int zz = 0; zz < c.n_fields; ++zz) {
-        float local_val = 0.0f;
-        for (int ii = 0; ii < 4; ++ii) {
-            for (int jj = 0; jj < 4; ++jj) {
-                for (int kk = 0; kk < 4; ++kk) {
-                    int row_idx = 64 * (cell_i * c.n_x23 + cell_j * c.n_x3 + cell_k) + 16 * ii + 4 * jj + kk;
-                    local_val += quad_pts[c.n_fields * row_idx + zz] * s1[ii] * s2[jj] * s3[kk];
-                }
-            }
-        }
-        out[p * c.n_fields + zz] = local_val;
+        out[p * c.n_fields + zz] = interp[zz];
     }
 
     if (symmetry_exploited) {
