@@ -33,7 +33,10 @@ HAS_GPU_DERIVATIVES = all(
         "test_derivatives_saw_nok",
     ]
 )
+# Metal derivative flags (one per mode as they are added incrementally).
 HAS_METAL_DERIV_BOOZER_VAC = hasattr(firm3dpp, "test_gpu_derivatives_boozer_vacuum")
+HAS_METAL_DERIV_CARTESIAN  = hasattr(firm3dpp, "test_gpu_derivatives_cartesian")
+
 HAS_GPU_TIMESTEP = all(
     hasattr(firm3dpp, name)
     for name in [
@@ -43,7 +46,7 @@ HAS_GPU_TIMESTEP = all(
     ]
 )
 
-# CUDA backend provides the full GPU API. Metal provides interpolation + boozer_vacuum derivatives.
+# CUDA backend provides the full GPU API. Metal provides interpolation + select derivatives.
 HAS_CUDA_BACKEND = hasattr(firm3dpp, "boozer_gpu_tracing")
 IS_METAL_BACKEND = HAS_GPU_INTERPOLATION and not HAS_CUDA_BACKEND
 
@@ -324,34 +327,18 @@ def run_derivatives_check(field, nfp, stz, vpar, vtotal, psi0, time=None, saw_pr
                 )
         elif field.field_type == "": # implies finite beta
             # evaluate CPU derivatives
-            # print("computing simsopt derivatives")
             cpu_derivs = np.empty((stz.shape[0], 4))
-            # start_time = time.time()
             for i in range(stz.shape[0]):
                 cpu_derivs[i, :] = firm3dpp.simsopt_derivs_boozer(
                     field, stz[i, :], MASS, CHARGE, vtotal, vpar[i], vacuum=False
                 )
-            # print(f"Time to compute simsopt derivatives: {time.time() - start_time} seconds")
 
-
-            ## evaluate GPU interpolant
             stz = np.ascontiguousarray(stz)
             vpar = np.ascontiguousarray(vpar)
-            # print("calculating new derivatives")
-            # start_time = time.time()
             gpu_derivs = firm3dpp.test_derivatives_boozer(
-                quad_info,
-                srange,
-                trange,
-                zrange,
-                stz.copy(),
-                vpar,
-                vtotal,
-                MASS,
-                CHARGE,
-                psi0,
-                stz.shape[0],
-                vacuum=False,
+                quad_info, srange, trange, zrange,
+                stz.copy(), vpar, vtotal, MASS, CHARGE, psi0,
+                stz.shape[0], vacuum=False,
             )
     gpu_derivs = np.reshape(gpu_derivs, (stz.shape[0], 4))
 
@@ -608,14 +595,13 @@ class TestGPUTracing(unittest.TestCase):
             return
 
         ### test derivatives
-        tol = 1e-8
         VELOCITY = np.sqrt(2 * ENERGY / MASS)
         vpar_init = np.random.uniform(-VELOCITY, VELOCITY, (n_test_pts,))
-        is_small = run_derivatives_check(field, nfp, stz, vpar_init, VELOCITY, field.psi0, tol=tol)
+        is_small = run_derivatives_check(field, nfp, stz, vpar_init, VELOCITY, field.psi0, tol=1e-8)
         self.assertTrue(is_small)
 
         ### test timesteps
-        is_small = run_timestep_check(field, nfp, stz, vpar_init, VELOCITY, field.psi0, tol=tol)
+        is_small = run_timestep_check(field, nfp, stz, vpar_init, VELOCITY, field.psi0, tol=1e-8)
         self.assertTrue(is_small)
 
     def test_boozer_vacuum_saw(self):

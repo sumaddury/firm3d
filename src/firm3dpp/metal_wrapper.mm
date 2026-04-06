@@ -19,288 +19,167 @@ namespace {
 
 enum {
     F3D_RHS_CARTESIAN_VACUUM = 0,
-    F3D_RHS_BOOZER_VACUUM = 1,
+    F3D_RHS_BOOZER_VACUUM    = 1,
     F3D_RHS_BOOZER_SAW_VACUUM = 2,
-    F3D_RHS_BOOZER = 3
+    F3D_RHS_BOOZER           = 3
 };
 
 struct InterpolationTestConstants {
-    int n_x2;
-    int n_x3;
-    int n_x23;
-    int n_fields;
-    int n_points;
-    int rhs_mode;
-
-    int x1_count;
-    int x2_count;
-    int x3_count;
-
-    float x1_start;
-    float x2_start;
-    float x2_period;
-    float x3_start;
-    float x3_period;
-
-    float x1_step;
-    float x2_step;
-    float x3_step;
+    int n_x2, n_x3, n_x23, n_fields, n_points, rhs_mode;
+    int x1_count, x2_count, x3_count;
+    float x1_start, x2_start, x2_period, x3_start, x3_period;
+    float x1_step, x2_step, x3_step;
 };
 
 struct DerivativeConstants {
-    int x1_count;
-    int x2_count;
-    int x3_count;
-
-    int n_x2;
-    int n_x3;
-    int n_x23;
-    int n_points;
-
-    float x1_start;
-    float x2_start;
-    float x2_period;
-    float x3_start;
-    float x3_period;
-
-    float x1_step;
-    float x2_step;
-    float x3_step;
-
-    float mass;
-    float charge;
-    float psi0;
-    float v_total;
+    int x1_count, x2_count, x3_count;
+    int n_x2, n_x3, n_x23, n_points;
+    float x1_start, x2_start, x2_period, x3_start, x3_period;
+    float x1_step, x2_step, x3_step;
+    float mass, charge, psi0, v_total;
 };
+
+// ---------------------------------------------------------------------------
+// Metal context: device, command queue, and one pipeline per kernel function.
+// ---------------------------------------------------------------------------
 
 struct MetalContext {
-    id<MTLDevice> device = nil;
-    id<MTLCommandQueue> queue = nil;
-    id<MTLComputePipelineState> pipeline_f32 = nil;
-    id<MTLComputePipelineState> pipeline_derivs = nil;
+    id<MTLDevice>              device                      = nil;
+    id<MTLCommandQueue>        queue                       = nil;
+    id<MTLComputePipelineState> pipeline_interp            = nil;
+    id<MTLComputePipelineState> pipeline_derivs_boozer_vac = nil;
+    id<MTLComputePipelineState> pipeline_derivs_cartesian  = nil;
 };
 
-std::string load_file(const std::string& path) {
+static std::string load_file(const std::string& path) {
     std::ifstream in(path);
-    if (!in.good()) {
-        throw std::runtime_error("Failed to open file: " + path);
-    }
+    if (!in.good()) throw std::runtime_error("Failed to open file: " + path);
     return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 }
 
-std::string find_kernel_source_path() {
-    if (const char* env = std::getenv("FIRM3DPP_METAL_KERNEL_PATH")) {
+static std::string find_kernel_source_path() {
+    if (const char* env = std::getenv("FIRM3DPP_METAL_KERNEL_PATH"))
         return std::string(env);
+    for (const auto& p : {"apple_kernel.metal", "src/firm3dpp/apple_kernel.metal"}) {
+        if (std::ifstream(p).good()) return p;
     }
-
-    const std::vector<std::string> candidates = {
-        "apple_kernel.metal",
-        "src/firm3dpp/apple_kernel.metal"
-    };
-    for (const auto& p : candidates) {
-        std::ifstream in(p);
-        if (in.good()) {
-            return p;
-        }
-    }
-
     throw std::runtime_error(
-        "Could not find apple_kernel.metal. Set FIRM3DPP_METAL_KERNEL_PATH to the full path."
-    );
+        "Could not find apple_kernel.metal. Set FIRM3DPP_METAL_KERNEL_PATH.");
 }
 
-id<MTLComputePipelineState> create_pipeline_state(id<MTLDevice> device, id<MTLLibrary> lib, NSString* kernel_name) {
-    id<MTLFunction> fn = [lib newFunctionWithName:kernel_name];
-    if (fn == nil) {
-        throw std::runtime_error(
-            std::string("Kernel ") + std::string([kernel_name UTF8String]) + " not found in Metal source."
-        );
+static id<MTLComputePipelineState> make_pipeline(
+    id<MTLDevice> device, id<MTLLibrary> lib, NSString* name)
+{
+    id<MTLFunction> fn = [lib newFunctionWithName:name];
+    if (fn == nil)
+        throw std::runtime_error("Kernel not found in Metal source: " +
+                                 std::string([name UTF8String]));
+    NSError* err = nil;
+    id<MTLComputePipelineState> ps = [device newComputePipelineStateWithFunction:fn error:&err];
+    if (ps == nil) {
+        std::string msg = err ? std::string([[err localizedDescription] UTF8String]) : "unknown";
+        throw std::runtime_error("Failed to create Metal pipeline for " +
+                                 std::string([name UTF8String]) + ": " + msg);
     }
-
-    NSError* pso_error = nil;
-    id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:fn error:&pso_error];
-    if (pipeline == nil) {
-        std::string err = pso_error ? std::string([[pso_error localizedDescription] UTF8String]) : "unknown";
-        throw std::runtime_error(
-            std::string("Failed to create Metal pipeline for ")
-            + std::string([kernel_name UTF8String]) + ": " + err
-        );
-    }
-    return pipeline;
+    return ps;
 }
 
-MetalContext& metal_context() {
+static MetalContext& metal_context() {
     static MetalContext ctx = []() {
         MetalContext local;
         @autoreleasepool {
             local.device = MTLCreateSystemDefaultDevice();
-            if (local.device == nil) {
-                throw std::runtime_error("Metal device not available");
-            }
+            if (local.device == nil) throw std::runtime_error("Metal device not available");
 
             local.queue = [local.device newCommandQueue];
-            if (local.queue == nil) {
-                throw std::runtime_error("Failed to create Metal command queue");
-            }
+            if (local.queue == nil) throw std::runtime_error("Failed to create Metal command queue");
 
-            const std::string kernel_path = find_kernel_source_path();
-            const std::string source = load_file(kernel_path);
-            NSString* ns_source = [NSString stringWithUTF8String:source.c_str()];
-
-            NSError* lib_error = nil;
-            id<MTLLibrary> lib = [local.device newLibraryWithSource:ns_source options:nil error:&lib_error];
+            const std::string src = load_file(find_kernel_source_path());
+            NSString* ns_src = [NSString stringWithUTF8String:src.c_str()];
+            NSError* lib_err = nil;
+            id<MTLLibrary> lib = [local.device newLibraryWithSource:ns_src options:nil error:&lib_err];
             if (lib == nil) {
-                std::string err = lib_error ? std::string([[lib_error localizedDescription] UTF8String]) : "unknown";
-                throw std::runtime_error("Failed to compile Metal source " + kernel_path + ": " + err);
+                std::string msg = lib_err
+                    ? std::string([[lib_err localizedDescription] UTF8String]) : "unknown";
+                throw std::runtime_error("Failed to compile Metal source: " + msg);
             }
 
-            local.pipeline_f32 = create_pipeline_state(local.device, lib, @"test_gpu_interpolation_kernel");
-            local.pipeline_derivs = create_pipeline_state(local.device, lib, @"test_gpu_derivs_kernel");
+            local.pipeline_interp            = make_pipeline(local.device, lib, @"test_gpu_interpolation_kernel");
+            local.pipeline_derivs_boozer_vac = make_pipeline(local.device, lib, @"test_gpu_derivs_boozer_vacuum_kernel");
+            local.pipeline_derivs_cartesian  = make_pipeline(local.device, lib, @"test_gpu_derivs_cartesian_kernel");
         }
         return local;
     }();
-
     return ctx;
 }
 
-struct RhsSpec {
-    int mode;
-    int n_fields;
-};
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
 
-bool has_suffix(const std::string& value, const std::string& suffix) {
-    if (value.size() < suffix.size()) {
-        return false;
-    }
-    return value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
-}
-
-RhsSpec parse_rhs(std::string rhs) {
-    if (has_suffix(rhs, "_f32")) {
-        rhs.erase(rhs.size() - 4);
-    } else if (has_suffix(rhs, "_f64")) {
-        throw std::invalid_argument("Metal f64 mode is not supported on this device/build. Use *_f32.");
-    }
-
-    if (rhs == "cartesian_vacuum") {
-        return RhsSpec{F3D_RHS_CARTESIAN_VACUUM, 7};
-    }
-    if (rhs == "boozer_vacuum") {
-        return RhsSpec{F3D_RHS_BOOZER_VACUUM, 6};
-    }
-    if (rhs == "boozer_saw_vacuum") {
-        return RhsSpec{F3D_RHS_BOOZER_SAW_VACUUM, 10};
-    }
-    if (rhs == "boozer") {
-        return RhsSpec{F3D_RHS_BOOZER, 12};
-    }
-    throw std::invalid_argument("Unsupported rhs: " + rhs);
-}
-
-void preprocess_loc_for_cuda_compat(std::vector<double>& loc, int rhs_mode, int n_points) {
-    if (rhs_mode == F3D_RHS_CARTESIAN_VACUUM) {
-        for (int i = 0; i < n_points; ++i) {
-            const double r = loc[3 * i + 0];
-            const double phi = loc[3 * i + 1];
-            loc[3 * i + 0] = r * std::cos(phi);
-            loc[3 * i + 1] = r * std::sin(phi);
-        }
-    } else {
-        for (int i = 0; i < n_points; ++i) {
-            const double s = loc[3 * i + 0];
-            const double theta = loc[3 * i + 1];
-            loc[3 * i + 0] = s * std::cos(theta);
-            loc[3 * i + 1] = s * std::sin(theta);
-        }
-    }
-}
-
-}
-
-extern "C" py::array_t<double> test_gpu_derivatives_boozer_vacuum(
-    py::array_t<double> quad_pts,
-    py::array_t<double> x1_range,
-    py::array_t<double> x2_range,
-    py::array_t<double> x3_range,
-    py::array_t<double> loc,
-    py::array_t<double> vpar,
-    py::array_t<double> time,
-    double v_total, double m, double q, double psi0,
-    int n_points
-) {
-    double* x1_ptr   = static_cast<double*>(x1_range.request().ptr);
-    double* x2_ptr   = static_cast<double*>(x2_range.request().ptr);
-    double* x3_ptr   = static_cast<double*>(x3_range.request().ptr);
-    double* quad_ptr = static_cast<double*>(quad_pts.request().ptr);
-    double* loc_ptr  = static_cast<double*>(loc.request().ptr);
-    double* vpar_ptr = static_cast<double*>(vpar.request().ptr);
-    double* time_ptr = static_cast<double*>(time.request().ptr);
-
-    const int x1_count = static_cast<int>(x1_ptr[2]);
-    const int x2_count = static_cast<int>(x2_ptr[2]);
-    const int x3_count = static_cast<int>(x3_ptr[2]);
-    const double x1_step = (x1_ptr[1] - x1_ptr[0]) / (x1_ptr[2] - 1.0);
-    const double x2_step = (x2_ptr[1] - x2_ptr[0]) / (x2_ptr[2] - 1.0);
-    const double x3_step = (x3_ptr[1] - x3_ptr[0]) / (x3_ptr[2] - 1.0);
-    const int n_x2  = (x2_count - 1) / 3;
-    const int n_x3  = (x3_count - 1) / 3;
-    const int n_x23 = n_x2 * n_x3;
+// Build a DerivativeConstants struct from the three range arrays passed from Python.
+// Range arrays have layout [start, end_or_period, n_points].
+static DerivativeConstants make_deriv_constants(
+    const double* x1, const double* x2, const double* x3,
+    double mass, double charge, double psi0, double v_total,
+    int n_points)
+{
+    const int x1c = static_cast<int>(x1[2]);
+    const int x2c = static_cast<int>(x2[2]);
+    const int x3c = static_cast<int>(x3[2]);
+    const double x1s = (x1[1] - x1[0]) / (x1[2] - 1.0);
+    const double x2s = (x2[1] - x2[0]) / (x2[2] - 1.0);
+    const double x3s = (x3[1] - x3[0]) / (x3[2] - 1.0);
+    const int n_x2  = (x2c - 1) / 3;
+    const int n_x3  = (x3c - 1) / 3;
 
     DerivativeConstants dc{};
-    dc.x1_count  = x1_count;
-    dc.x2_count  = x2_count;
-    dc.x3_count  = x3_count;
-    dc.n_x2      = n_x2;
-    dc.n_x3      = n_x3;
-    dc.n_x23     = n_x23;
+    dc.x1_count  = x1c;    dc.x2_count  = x2c;    dc.x3_count  = x3c;
+    dc.n_x2      = n_x2;   dc.n_x3      = n_x3;   dc.n_x23     = n_x2 * n_x3;
     dc.n_points  = n_points;
-    dc.x1_start  = static_cast<float>(x1_ptr[0]);
-    dc.x2_start  = static_cast<float>(x2_ptr[0]);
-    dc.x2_period = static_cast<float>(x2_ptr[1]);
-    dc.x3_start  = static_cast<float>(x3_ptr[0]);
-    dc.x3_period = static_cast<float>(x3_ptr[1]);
-    dc.x1_step   = static_cast<float>(x1_step);
-    dc.x2_step   = static_cast<float>(x2_step);
-    dc.x3_step   = static_cast<float>(x3_step);
-    dc.mass      = static_cast<float>(m);
-    dc.charge    = static_cast<float>(q);
+    dc.x1_start  = static_cast<float>(x1[0]);
+    dc.x2_start  = static_cast<float>(x2[0]);   dc.x2_period = static_cast<float>(x2[1]);
+    dc.x3_start  = static_cast<float>(x3[0]);   dc.x3_period = static_cast<float>(x3[1]);
+    dc.x1_step   = static_cast<float>(x1s);
+    dc.x2_step   = static_cast<float>(x2s);
+    dc.x3_step   = static_cast<float>(x3s);
+    dc.mass      = static_cast<float>(mass);
+    dc.charge    = static_cast<float>(charge);
     dc.psi0      = static_cast<float>(psi0);
     dc.v_total   = static_cast<float>(v_total);
+    return dc;
+}
 
-    std::vector<float> quad_f(quad_pts.size());
-    std::vector<float> loc_f(loc.size());
-    std::vector<float> vpar_f(n_points);
-    std::vector<float> time_f(n_points);
-    for (size_t i = 0; i < quad_f.size(); ++i) quad_f[i] = static_cast<float>(quad_ptr[i]);
-    for (size_t i = 0; i < loc_f.size(); ++i)  loc_f[i]  = static_cast<float>(loc_ptr[i]);
-    for (int i = 0; i < n_points; ++i)          vpar_f[i] = static_cast<float>(vpar_ptr[i]);
-    for (int i = 0; i < n_points; ++i)          time_f[i] = static_cast<float>(time_ptr[i]);
-
+// Dispatch a derivatives kernel and return results as a flat f64 array of length 4*n_points.
+// All inputs must already be in f32.
+static py::array_t<double> metal_dispatch_derivs(
+    id<MTLComputePipelineState> pipeline,
+    const std::vector<float>& quad_f,
+    const std::vector<float>& loc_f,
+    const std::vector<float>& vpar_f,
+    const std::vector<float>& time_f,
+    const DerivativeConstants& dc)
+{
     auto& ctx = metal_context();
-    const size_t out_count = 4 * static_cast<size_t>(n_points);
+    const size_t out_count = 4 * static_cast<size_t>(dc.n_points);
 
     @autoreleasepool {
-        id<MTLBuffer> quad_m = [ctx.device newBufferWithBytes:quad_f.data()
-                                                        length:quad_f.size() * sizeof(float)
-                                                       options:MTLResourceStorageModeShared];
-        id<MTLBuffer> loc_m  = [ctx.device newBufferWithBytes:loc_f.data()
-                                                        length:loc_f.size() * sizeof(float)
-                                                       options:MTLResourceStorageModeShared];
-        id<MTLBuffer> vpar_m = [ctx.device newBufferWithBytes:vpar_f.data()
-                                                        length:vpar_f.size() * sizeof(float)
-                                                       options:MTLResourceStorageModeShared];
-        id<MTLBuffer> time_m = [ctx.device newBufferWithBytes:time_f.data()
-                                                        length:time_f.size() * sizeof(float)
-                                                       options:MTLResourceStorageModeShared];
-        id<MTLBuffer> out_m  = [ctx.device newBufferWithLength:out_count * sizeof(float)
-                                                        options:MTLResourceStorageModeShared];
-        id<MTLBuffer> dc_m   = [ctx.device newBufferWithBytes:&dc
-                                                        length:sizeof(dc)
-                                                       options:MTLResourceStorageModeShared];
+        auto make_buf = [&](const void* data, size_t bytes) {
+            return [ctx.device newBufferWithBytes:data length:bytes
+                                         options:MTLResourceStorageModeShared];
+        };
 
-        id<MTLCommandBuffer>       cb  = [ctx.queue commandBuffer];
+        id<MTLBuffer> quad_m = make_buf(quad_f.data(), quad_f.size() * sizeof(float));
+        id<MTLBuffer> loc_m  = make_buf(loc_f.data(),  loc_f.size()  * sizeof(float));
+        id<MTLBuffer> vpar_m = make_buf(vpar_f.data(), vpar_f.size() * sizeof(float));
+        id<MTLBuffer> time_m = make_buf(time_f.data(), time_f.size() * sizeof(float));
+        id<MTLBuffer> out_m  = [ctx.device newBufferWithLength:out_count * sizeof(float)
+                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dc_m   = make_buf(&dc, sizeof(dc));
+
+        id<MTLCommandBuffer>         cb  = [ctx.queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-        [enc setComputePipelineState:ctx.pipeline_derivs];
+        [enc setComputePipelineState:pipeline];
         [enc setBuffer:quad_m offset:0 atIndex:0];
         [enc setBuffer:loc_m  offset:0 atIndex:1];
         [enc setBuffer:vpar_m offset:0 atIndex:2];
@@ -308,10 +187,9 @@ extern "C" py::array_t<double> test_gpu_derivatives_boozer_vacuum(
         [enc setBuffer:out_m  offset:0 atIndex:4];
         [enc setBuffer:dc_m   offset:0 atIndex:5];
 
-        const NSUInteger total_threads = static_cast<NSUInteger>(n_points);
-        const NSUInteger tpg = std::min<NSUInteger>(ctx.pipeline_derivs.maxTotalThreadsPerThreadgroup, 256);
-        [enc dispatchThreads:MTLSizeMake(total_threads, 1, 1)
-          threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        const NSUInteger total = static_cast<NSUInteger>(dc.n_points);
+        const NSUInteger tpg   = std::min<NSUInteger>(pipeline.maxTotalThreadsPerThreadgroup, 256);
+        [enc dispatchThreads:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
         [enc endEncoding];
         [cb commit];
         [cb waitUntilCompleted];
@@ -319,18 +197,62 @@ extern "C" py::array_t<double> test_gpu_derivatives_boozer_vacuum(
         if (cb.status == MTLCommandBufferStatusError) {
             std::string err = cb.error
                 ? std::string([[cb.error localizedDescription] UTF8String]) : "unknown";
-            throw std::runtime_error("test_gpu_derivatives_boozer_vacuum dispatch failed: " + err);
+            throw std::runtime_error("Metal derivatives dispatch failed: " + err);
         }
 
         py::array_t<double> result(out_count);
-        const float*  out_ptr    = static_cast<const float*>([out_m contents]);
-        double*       result_ptr = static_cast<double*>(result.request().ptr);
-        for (size_t i = 0; i < out_count; ++i) {
-            result_ptr[i] = static_cast<double>(out_ptr[i]);
-        }
+        const float*  src = static_cast<const float*>([out_m contents]);
+        double*       dst = static_cast<double*>(result.request().ptr);
+        for (size_t i = 0; i < out_count; ++i) dst[i] = static_cast<double>(src[i]);
         return result;
     }
 }
+
+// Convert a Python f64 array to a std::vector<float>.
+static std::vector<float> to_f32(const double* ptr, size_t n) {
+    std::vector<float> out(n);
+    for (size_t i = 0; i < n; ++i) out[i] = static_cast<float>(ptr[i]);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// RHS-specific helpers
+// ---------------------------------------------------------------------------
+
+struct RhsSpec { int mode; int n_fields; };
+
+static bool has_suffix(const std::string& s, const std::string& sfx) {
+    return s.size() >= sfx.size() &&
+           s.compare(s.size() - sfx.size(), sfx.size(), sfx) == 0;
+}
+
+static RhsSpec parse_rhs(std::string rhs) {
+    if (has_suffix(rhs, "_f32")) rhs.erase(rhs.size() - 4);
+    else if (has_suffix(rhs, "_f64"))
+        throw std::invalid_argument("Metal f64 mode not supported. Use *_f32.");
+    if (rhs == "cartesian_vacuum")  return {F3D_RHS_CARTESIAN_VACUUM,  7};
+    if (rhs == "boozer_vacuum")     return {F3D_RHS_BOOZER_VACUUM,     6};
+    if (rhs == "boozer_saw_vacuum") return {F3D_RHS_BOOZER_SAW_VACUUM, 10};
+    if (rhs == "boozer")            return {F3D_RHS_BOOZER,            12};
+    throw std::invalid_argument("Unsupported rhs: " + rhs);
+}
+
+// For the interpolation test, Python passes loc in (coord1, angle, coord3) form.
+// The GPU kernel expects (x, y, coord3) = (coord1*cos(angle), coord1*sin(angle), coord3).
+static void preprocess_loc(std::vector<double>& loc, int n_points) {
+    for (int i = 0; i < n_points; ++i) {
+        const double c1  = loc[3 * i + 0];
+        const double ang = loc[3 * i + 1];
+        loc[3 * i + 0] = c1 * std::cos(ang);
+        loc[3 * i + 1] = c1 * std::sin(ang);
+    }
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
 
 extern "C" py::array_t<double> test_gpu_interpolation(
     py::array_t<double> quad_pts,
@@ -339,110 +261,132 @@ extern "C" py::array_t<double> test_gpu_interpolation(
     py::array_t<double> x3_range,
     py::array_t<double> loc,
     std::string rhs,
-    int n_points
-) {
-    py::buffer_info quad_buf = quad_pts.request();
-    py::buffer_info x1_buf = x1_range.request();
-    py::buffer_info x2_buf = x2_range.request();
-    py::buffer_info x3_buf = x3_range.request();
-    py::buffer_info loc_buf = loc.request();
+    int n_points)
+{
+    const RhsSpec spec  = parse_rhs(rhs);
+    const double* x1    = static_cast<double*>(x1_range.request().ptr);
+    const double* x2    = static_cast<double*>(x2_range.request().ptr);
+    const double* x3    = static_cast<double*>(x3_range.request().ptr);
+    const double* qptr  = static_cast<double*>(quad_pts.request().ptr);
+    const double* lptr  = static_cast<double*>(loc.request().ptr);
 
-    double* quad_ptr = static_cast<double*>(quad_buf.ptr);
-    double* x1_ptr = static_cast<double*>(x1_buf.ptr);
-    double* x2_ptr = static_cast<double*>(x2_buf.ptr);
-    double* x3_ptr = static_cast<double*>(x3_buf.ptr);
-    double* loc_ptr = static_cast<double*>(loc_buf.ptr);
+    const int x1c = static_cast<int>(x1[2]);
+    const int x2c = static_cast<int>(x2[2]);
+    const int x3c = static_cast<int>(x3[2]);
+    const double x1s = (x1[1] - x1[0]) / (x1[2] - 1.0);
+    const double x2s = (x2[1] - x2[0]) / (x2[2] - 1.0);
+    const double x3s = (x3[1] - x3[0]) / (x3[2] - 1.0);
+    const int n_x2  = (x2c - 1) / 3;
+    const int n_x3  = (x3c - 1) / 3;
 
-    const RhsSpec rhs_spec = parse_rhs(rhs);
-    const int rhs_mode = rhs_spec.mode;
-    const int n_fields = rhs_spec.n_fields;
+    InterpolationTestConstants c{};
+    c.n_x2     = n_x2;  c.n_x3   = n_x3;  c.n_x23    = n_x2 * n_x3;
+    c.n_fields = spec.n_fields;  c.n_points = n_points;  c.rhs_mode = spec.mode;
+    c.x1_count = x1c;   c.x2_count = x2c;  c.x3_count  = x3c;
+    c.x1_start = static_cast<float>(x1[0]);
+    c.x2_start = static_cast<float>(x2[0]);  c.x2_period = static_cast<float>(x2[1]);
+    c.x3_start = static_cast<float>(x3[0]);  c.x3_period = static_cast<float>(x3[1]);
+    c.x1_step  = static_cast<float>(x1s);
+    c.x2_step  = static_cast<float>(x2s);
+    c.x3_step  = static_cast<float>(x3s);
 
-    const int x1_count = static_cast<int>(x1_ptr[2]);
-    const int x2_count = static_cast<int>(x2_ptr[2]);
-    const int x3_count = static_cast<int>(x3_ptr[2]);
+    // Convert loc to (x, y, z) in-place on a local copy.
+    std::vector<double> loc_host(lptr, lptr + loc.size());
+    preprocess_loc(loc_host, n_points);
 
-    const double x1_step = (x1_ptr[1] - x1_ptr[0]) / (x1_ptr[2] - 1.0);
-    const double x2_step = (x2_ptr[1] - x2_ptr[0]) / (x2_ptr[2] - 1.0);
-    const double x3_step = (x3_ptr[1] - x3_ptr[0]) / (x3_ptr[2] - 1.0);
-
-    const int n_x2 = (x2_count - 1) / 3;
-    const int n_x3 = (x3_count - 1) / 3;
-    const int n_x23 = n_x2 * n_x3;
-
-    std::vector<double> loc_host(loc_ptr, loc_ptr + loc.size());
-    preprocess_loc_for_cuda_compat(loc_host, rhs_mode, n_points);
-
-    InterpolationTestConstants constants{};
-    constants.n_x2 = n_x2;
-    constants.n_x3 = n_x3;
-    constants.n_x23 = n_x23;
-    constants.n_fields = n_fields;
-    constants.n_points = n_points;
-    constants.rhs_mode = rhs_mode;
-    constants.x1_count = x1_count;
-    constants.x2_count = x2_count;
-    constants.x3_count = x3_count;
-    constants.x1_start = static_cast<float>(x1_ptr[0]);
-    constants.x2_start = static_cast<float>(x2_ptr[0]);
-    constants.x2_period = static_cast<float>(x2_ptr[1]);
-    constants.x3_start = static_cast<float>(x3_ptr[0]);
-    constants.x3_period = static_cast<float>(x3_ptr[1]);
-    constants.x1_step = static_cast<float>(x1_step);
-    constants.x2_step = static_cast<float>(x2_step);
-    constants.x3_step = static_cast<float>(x3_step);
+    const std::vector<float> quad_f = to_f32(qptr, quad_pts.size());
+    const std::vector<float> loc_f  = to_f32(loc_host.data(), loc_host.size());
 
     auto& ctx = metal_context();
+    const size_t out_count = static_cast<size_t>(spec.n_fields) * static_cast<size_t>(n_points);
 
     @autoreleasepool {
-        id<MTLBuffer> c_m = [ctx.device newBufferWithBytes:&constants length:sizeof(constants)
-                                                    options:MTLResourceStorageModeShared];
-        const NSUInteger total_threads = static_cast<NSUInteger>(n_points);
-        const size_t out_count = size_t(n_fields) * size_t(n_points);
-        std::vector<float> quad_host(quad_pts.size());
-        std::vector<float> loc_host_f(loc_host.size());
-        for (size_t i = 0; i < quad_host.size(); ++i) {
-            quad_host[i] = static_cast<float>(quad_ptr[i]);
-        }
-        for (size_t i = 0; i < loc_host_f.size(); ++i) {
-            loc_host_f[i] = static_cast<float>(loc_host[i]);
-        }
+        auto make_buf = [&](const void* data, size_t bytes) {
+            return [ctx.device newBufferWithBytes:data length:bytes
+                                         options:MTLResourceStorageModeShared];
+        };
 
-        id<MTLBuffer> quad_m = [ctx.device newBufferWithBytes:quad_host.data()
-                                                        length:quad_host.size() * sizeof(float)
+        id<MTLBuffer> quad_m = make_buf(quad_f.data(), quad_f.size() * sizeof(float));
+        id<MTLBuffer> loc_m  = make_buf(loc_f.data(),  loc_f.size()  * sizeof(float));
+        id<MTLBuffer> out_m  = [ctx.device newBufferWithLength:out_count * sizeof(float)
                                                        options:MTLResourceStorageModeShared];
-        id<MTLBuffer> loc_m = [ctx.device newBufferWithBytes:loc_host_f.data()
-                                                       length:loc_host_f.size() * sizeof(float)
-                                                      options:MTLResourceStorageModeShared];
-        id<MTLBuffer> out_m = [ctx.device newBufferWithLength:out_count * sizeof(float)
-                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> c_m    = make_buf(&c, sizeof(c));
 
-        id<MTLCommandBuffer> cb = [ctx.queue commandBuffer];
+        id<MTLCommandBuffer>         cb  = [ctx.queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-        [enc setComputePipelineState:ctx.pipeline_f32];
+        [enc setComputePipelineState:ctx.pipeline_interp];
         [enc setBuffer:quad_m offset:0 atIndex:0];
-        [enc setBuffer:loc_m offset:0 atIndex:1];
-        [enc setBuffer:out_m offset:0 atIndex:2];
-        [enc setBuffer:c_m offset:0 atIndex:3];
+        [enc setBuffer:loc_m  offset:0 atIndex:1];
+        [enc setBuffer:out_m  offset:0 atIndex:2];
+        [enc setBuffer:c_m    offset:0 atIndex:3];
 
-        const NSUInteger threads_per_group = std::min<NSUInteger>(ctx.pipeline_f32.maxTotalThreadsPerThreadgroup, 256);
-        [enc dispatchThreads:MTLSizeMake(total_threads, 1, 1)
-          threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1, 1)];
+        const NSUInteger total = static_cast<NSUInteger>(n_points);
+        const NSUInteger tpg   = std::min<NSUInteger>(ctx.pipeline_interp.maxTotalThreadsPerThreadgroup, 256);
+        [enc dispatchThreads:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
         [enc endEncoding];
         [cb commit];
         [cb waitUntilCompleted];
 
         if (cb.status == MTLCommandBufferStatusError) {
-            std::string err = cb.error ? std::string([[cb.error localizedDescription] UTF8String]) : "unknown";
-            throw std::runtime_error("Metal f32 test_gpu_interpolation dispatch failed: " + err);
+            std::string err = cb.error
+                ? std::string([[cb.error localizedDescription] UTF8String]) : "unknown";
+            throw std::runtime_error("Metal interpolation dispatch failed: " + err);
         }
 
         py::array_t<double> result(out_count);
-        py::buffer_info result_buf = result.request();
-        const float* out_ptr = static_cast<const float*>([out_m contents]);
-        double* result_ptr = static_cast<double*>(result_buf.ptr);
-        for (size_t i = 0; i < out_count; ++i) {
-            result_ptr[i] = static_cast<double>(out_ptr[i]);
-        }
+        const float*  src = static_cast<const float*>([out_m contents]);
+        double*       dst = static_cast<double*>(result.request().ptr);
+        for (size_t i = 0; i < out_count; ++i) dst[i] = static_cast<double>(src[i]);
         return result;
     }
 }
+
+extern "C" py::array_t<double> test_gpu_derivatives_boozer_vacuum(
+    py::array_t<double> quad_pts,
+    py::array_t<double> x1_range, py::array_t<double> x2_range, py::array_t<double> x3_range,
+    py::array_t<double> loc, py::array_t<double> vpar, py::array_t<double> time,
+    double v_total, double m, double q, double psi0, int n_points)
+{
+    const double* x1   = static_cast<double*>(x1_range.request().ptr);
+    const double* x2   = static_cast<double*>(x2_range.request().ptr);
+    const double* x3   = static_cast<double*>(x3_range.request().ptr);
+    const double* qptr = static_cast<double*>(quad_pts.request().ptr);
+    const double* lptr = static_cast<double*>(loc.request().ptr);
+    const double* vptr = static_cast<double*>(vpar.request().ptr);
+    const double* tptr = static_cast<double*>(time.request().ptr);
+
+    const DerivativeConstants dc = make_deriv_constants(x1, x2, x3, m, q, psi0, v_total, n_points);
+    return metal_dispatch_derivs(
+        metal_context().pipeline_derivs_boozer_vac,
+        to_f32(qptr, quad_pts.size()),
+        to_f32(lptr, loc.size()),
+        to_f32(vptr, n_points),
+        to_f32(tptr, n_points),
+        dc);
+}
+
+extern "C" py::array_t<double> test_gpu_derivatives_cartesian(
+    py::array_t<double> quad_pts,
+    py::array_t<double> x1_range, py::array_t<double> x2_range, py::array_t<double> x3_range,
+    py::array_t<double> loc, py::array_t<double> vpar, py::array_t<double> time,
+    double v_total, double m, double q, int n_points)
+{
+    const double* x1   = static_cast<double*>(x1_range.request().ptr);
+    const double* x2   = static_cast<double*>(x2_range.request().ptr);
+    const double* x3   = static_cast<double*>(x3_range.request().ptr);
+    const double* qptr = static_cast<double*>(quad_pts.request().ptr);
+    const double* lptr = static_cast<double*>(loc.request().ptr);
+    const double* vptr = static_cast<double*>(vpar.request().ptr);
+    const double* tptr = static_cast<double*>(time.request().ptr);
+
+    // psi0 is not used in the Cartesian RHS; pass 0.0.
+    const DerivativeConstants dc = make_deriv_constants(x1, x2, x3, m, q, 0.0, v_total, n_points);
+    return metal_dispatch_derivs(
+        metal_context().pipeline_derivs_cartesian,
+        to_f32(qptr, quad_pts.size()),
+        to_f32(lptr, loc.size()),
+        to_f32(vptr, n_points),
+        to_f32(tptr, n_points),
+        dc);
+}
+
