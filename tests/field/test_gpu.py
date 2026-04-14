@@ -37,6 +37,9 @@ HAS_GPU_DERIVATIVES = all(
 HAS_METAL_DERIV_BOOZER_VAC = hasattr(firm3dpp, "test_gpu_derivatives_boozer_vacuum")
 HAS_METAL_DERIV_CARTESIAN  = hasattr(firm3dpp, "test_gpu_derivatives_cartesian")
 
+# Metal timestep flags (one per mode as they are added incrementally).
+HAS_METAL_TIMESTEP_BOOZER_VAC = hasattr(firm3dpp, "test_gpu_timestep_boozer_vacuum")
+
 HAS_GPU_TIMESTEP = all(
     hasattr(firm3dpp, name)
     for name in [
@@ -463,21 +466,37 @@ def run_timestep_check(field, nfp, stz, vpar, vtotal, psi0, time=None, saw_filen
 
             stz = np.ascontiguousarray(stz)
             psi0 = field.psi0
-            last_time = firm3dpp.test_timestep_boozer(
-                quad_pts=quad_info,
-                srange=srange,
-                trange=trange,
-                zrange=zrange,
-                stz_init=stz,
-                m=MASS,
-                q=CHARGE,
-                vtotal=np.sqrt(2 * ENERGY / MASS),
-                vtang=vpar,
-                tol=1e-9,
-                psi0=psi0,
-                nparticles=stz.shape[0],
-                vacuum=True,
-            )
+            if HAS_METAL_TIMESTEP_BOOZER_VAC and not HAS_GPU_TIMESTEP:
+                last_time = firm3dpp.test_gpu_timestep_boozer_vacuum(
+                    quad_pts=quad_info,
+                    x1_range=srange,
+                    x2_range=trange,
+                    x3_range=zrange,
+                    loc=stz.copy(),
+                    vpar=vpar,
+                    v_total=np.sqrt(2 * ENERGY / MASS),
+                    m=MASS,
+                    q=CHARGE,
+                    psi0=psi0,
+                    tol=1e-9,
+                    n_points=stz.shape[0],
+                )
+            else:
+                last_time = firm3dpp.test_timestep_boozer(
+                    quad_pts=quad_info,
+                    srange=srange,
+                    trange=trange,
+                    zrange=zrange,
+                    stz_init=stz,
+                    m=MASS,
+                    q=CHARGE,
+                    vtotal=np.sqrt(2 * ENERGY / MASS),
+                    vtang=vpar,
+                    tol=1e-9,
+                    psi0=psi0,
+                    nparticles=stz.shape[0],
+                    vacuum=True,
+                )
             last_time = np.reshape(last_time, (stz.shape[0], 5))
         elif field.field_type == "": # implies finite beta
             gc_tys, gc_zeta_hits = trace_particles_boozer(
@@ -567,11 +586,12 @@ class TestGPUTracing(unittest.TestCase):
             is_small = run_derivatives_check(field, nfp, stz, vpar_init, VELOCITY, field.psi0, tol=deriv_tol)
             self.assertTrue(is_small)
 
-        if not (HAS_GPU_DERIVATIVES and HAS_GPU_TIMESTEP):
+        if not ((HAS_GPU_DERIVATIVES and HAS_GPU_TIMESTEP) or HAS_METAL_TIMESTEP_BOOZER_VAC):
             return
 
         ### test timesteps
-        is_small = run_timestep_check(field, nfp, stz, vpar_init, VELOCITY, field.psi0, tol=1e-8)
+        timestep_tol = INTERP_TOL if IS_METAL_BACKEND else 1e-8
+        is_small = run_timestep_check(field, nfp, stz, vpar_init, VELOCITY, field.psi0, tol=timestep_tol)
         self.assertTrue(is_small)
 
     def test_boozer_finite_beta(self):

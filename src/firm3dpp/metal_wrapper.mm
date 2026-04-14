@@ -37,6 +37,8 @@ struct DerivativeConstants {
     float x1_start, x2_start, x2_period, x3_start, x3_period;
     float x1_step, x2_step, x3_step;
     float mass, charge, psi0, v_total;
+    float tol;   // adaptive step tolerance (used by timestep kernel, 0 otherwise)
+    float tmax;  // maximum timestep cap   (used by timestep kernel, 0 otherwise)
 };
 
 // ---------------------------------------------------------------------------
@@ -44,11 +46,12 @@ struct DerivativeConstants {
 // ---------------------------------------------------------------------------
 
 struct MetalContext {
-    id<MTLDevice>              device                      = nil;
-    id<MTLCommandQueue>        queue                       = nil;
-    id<MTLComputePipelineState> pipeline_interp            = nil;
-    id<MTLComputePipelineState> pipeline_derivs_boozer_vac = nil;
-    id<MTLComputePipelineState> pipeline_derivs_cartesian  = nil;
+    id<MTLDevice>              device                         = nil;
+    id<MTLCommandQueue>        queue                          = nil;
+    id<MTLComputePipelineState> pipeline_interp               = nil;
+    id<MTLComputePipelineState> pipeline_derivs_boozer_vac    = nil;
+    id<MTLComputePipelineState> pipeline_derivs_cartesian     = nil;
+    id<MTLComputePipelineState> pipeline_timestep_boozer_vac  = nil;
 };
 
 static std::string load_file(const std::string& path) {
@@ -104,9 +107,10 @@ static MetalContext& metal_context() {
                 throw std::runtime_error("Failed to compile Metal source: " + msg);
             }
 
-            local.pipeline_interp            = make_pipeline(local.device, lib, @"test_gpu_interpolation_kernel");
-            local.pipeline_derivs_boozer_vac = make_pipeline(local.device, lib, @"test_gpu_derivs_boozer_vacuum_kernel");
-            local.pipeline_derivs_cartesian  = make_pipeline(local.device, lib, @"test_gpu_derivs_cartesian_kernel");
+            local.pipeline_interp              = make_pipeline(local.device, lib, @"test_gpu_interpolation_kernel");
+            local.pipeline_derivs_boozer_vac   = make_pipeline(local.device, lib, @"test_gpu_derivs_boozer_vacuum_kernel");
+            local.pipeline_derivs_cartesian    = make_pipeline(local.device, lib, @"test_gpu_derivs_cartesian_kernel");
+            local.pipeline_timestep_boozer_vac = make_pipeline(local.device, lib, @"test_gpu_timestep_boozer_vacuum_kernel");
         }
         return local;
     }();
@@ -147,6 +151,24 @@ static DerivativeConstants make_deriv_constants(
     dc.charge    = static_cast<float>(charge);
     dc.psi0      = static_cast<float>(psi0);
     dc.v_total   = static_cast<float>(v_total);
+    dc.tol       = 0.0f;
+    dc.tmax      = 0.0f;
+    return dc;
+}
+
+// Build a DerivativeConstants for one-timestep tests. tol drives the DP5 error
+// controller; tmax caps the maximum step size (mirrors CUDA's hardcoded 1e-2).
+static DerivativeConstants make_timestep_constants(
+    const double* x1, const double* x2, const double* x3,
+    double mass, double charge, double psi0, double v_total,
+    double tol, int n_points)
+{
+    DerivativeConstants dc = make_deriv_constants(x1, x2, x3, mass, charge, psi0, v_total, n_points);
+    // Floor the tolerance to something achievable in f32 so the step controller
+    // converges. 1e-5 is well above f32 machine epsilon (~1.2e-7) but tight
+    // enough to produce accurate single-step results.
+    dc.tol  = static_cast<float>(std::max(tol, 1e-5));
+    dc.tmax = 1e-2f;
     return dc;
 }
 
@@ -363,6 +385,87 @@ extern "C" py::array_t<double> test_gpu_derivatives_boozer_vacuum(
         to_f32(vptr, n_points),
         to_f32(tptr, n_points),
         dc);
+}
+
+// Run one adaptive DP5 step per particle (Boozer-vacuum mode).
+// loc: (n_points, 3) = [s, theta, zeta].
+// vpar: (n_points,).
+// Returns flat array of 5*n_points doubles: [t, s, theta, zeta, v_par] per particle.
+extern "C" py::array_t<double> test_gpu_timestep_boozer_vacuum(
+    py::array_t<double> quad_pts,
+    py::array_t<double> x1_range, py::array_t<double> x2_range, py::array_t<double> x3_range,
+    py::array_t<double> loc, py::array_t<double> vpar,
+    double v_total, double m, double q, double psi0,
+    double tol, int n_points)
+{
+    const double* x1   = static_cast<double*>(x1_range.request().ptr);
+    const double* x2   = static_cast<double*>(x2_range.request().ptr);
+    const double* x3   = static_cast<double*>(x3_range.request().ptr);
+    const double* qptr = static_cast<double*>(quad_pts.request().ptr);
+    const double* lptr = static_cast<double*>(loc.request().ptr);
+    const double* vptr = static_cast<double*>(vpar.request().ptr);
+
+    const DerivativeConstants dc = make_timestep_constants(x1, x2, x3, m, q, psi0, v_total, tol, n_points);
+
+    const std::vector<float> quad_f = to_f32(qptr, quad_pts.size());
+    const std::vector<float> loc_f  = to_f32(lptr, loc.size());
+    const std::vector<float> vpar_f = to_f32(vptr, n_points);
+
+    // Output: 5 floats per particle = [t, x1, x2, zeta, v_par].
+    const size_t out_count = 5 * static_cast<size_t>(n_points);
+    auto& ctx = metal_context();
+
+    @autoreleasepool {
+        auto make_buf = [&](const void* data, size_t bytes) {
+            return [ctx.device newBufferWithBytes:data length:bytes
+                                         options:MTLResourceStorageModeShared];
+        };
+
+        id<MTLBuffer> quad_m = make_buf(quad_f.data(), quad_f.size() * sizeof(float));
+        id<MTLBuffer> loc_m  = make_buf(loc_f.data(),  loc_f.size()  * sizeof(float));
+        id<MTLBuffer> vpar_m = make_buf(vpar_f.data(), vpar_f.size() * sizeof(float));
+        id<MTLBuffer> out_m  = [ctx.device newBufferWithLength:out_count * sizeof(float)
+                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dc_m   = make_buf(&dc, sizeof(dc));
+
+        id<MTLCommandBuffer>         cb  = [ctx.queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:ctx.pipeline_timestep_boozer_vac];
+        [enc setBuffer:quad_m offset:0 atIndex:0];
+        [enc setBuffer:loc_m  offset:0 atIndex:1];
+        [enc setBuffer:vpar_m offset:0 atIndex:2];
+        [enc setBuffer:out_m  offset:0 atIndex:3];
+        [enc setBuffer:dc_m   offset:0 atIndex:4];
+
+        const NSUInteger total = static_cast<NSUInteger>(n_points);
+        const NSUInteger tpg   = std::min<NSUInteger>(
+            ctx.pipeline_timestep_boozer_vac.maxTotalThreadsPerThreadgroup, 256);
+        [enc dispatchThreads:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+
+        if (cb.status == MTLCommandBufferStatusError) {
+            std::string err = cb.error
+                ? std::string([[cb.error localizedDescription] UTF8String]) : "unknown";
+            throw std::runtime_error("Metal timestep dispatch failed: " + err);
+        }
+
+        // Convert f32 output to f64 and transform (x1, x2) -> (s, theta).
+        py::array_t<double> result(out_count);
+        const float* src = static_cast<const float*>([out_m contents]);
+        double*      dst = static_cast<double*>(result.request().ptr);
+        for (int i = 0; i < n_points; ++i) {
+            dst[5 * i + 0] = static_cast<double>(src[5 * i + 0]);  // t
+            double x1v     = static_cast<double>(src[5 * i + 1]);
+            double x2v     = static_cast<double>(src[5 * i + 2]);
+            dst[5 * i + 1] = std::sqrt(x1v * x1v + x2v * x2v);    // s
+            dst[5 * i + 2] = std::atan2(x2v, x1v);                 // theta
+            dst[5 * i + 3] = static_cast<double>(src[5 * i + 3]);  // zeta
+            dst[5 * i + 4] = static_cast<double>(src[5 * i + 4]);  // v_par
+        }
+        return result;
+    }
 }
 
 extern "C" py::array_t<double> test_gpu_derivatives_cartesian(
