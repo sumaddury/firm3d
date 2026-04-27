@@ -52,6 +52,7 @@ struct MetalContext {
     id<MTLComputePipelineState> pipeline_derivs_boozer_vac    = nil;
     id<MTLComputePipelineState> pipeline_derivs_cartesian     = nil;
     id<MTLComputePipelineState> pipeline_timestep_boozer_vac  = nil;
+    id<MTLComputePipelineState> pipeline_tracing_boozer_vac   = nil;
 };
 
 static std::string load_file(const std::string& path) {
@@ -111,6 +112,7 @@ static MetalContext& metal_context() {
             local.pipeline_derivs_boozer_vac   = make_pipeline(local.device, lib, @"test_gpu_derivs_boozer_vacuum_kernel");
             local.pipeline_derivs_cartesian    = make_pipeline(local.device, lib, @"test_gpu_derivs_cartesian_kernel");
             local.pipeline_timestep_boozer_vac = make_pipeline(local.device, lib, @"test_gpu_timestep_boozer_vacuum_kernel");
+            local.pipeline_tracing_boozer_vac  = make_pipeline(local.device, lib, @"boozer_vacuum_tracing_kernel");
         }
         return local;
     }();
@@ -452,6 +454,88 @@ extern "C" py::array_t<double> test_gpu_timestep_boozer_vacuum(
         }
 
         // Convert f32 output to f64 and transform (x1, x2) -> (s, theta).
+        py::array_t<double> result(out_count);
+        const float* src = static_cast<const float*>([out_m contents]);
+        double*      dst = static_cast<double*>(result.request().ptr);
+        for (int i = 0; i < n_points; ++i) {
+            dst[5 * i + 0] = static_cast<double>(src[5 * i + 0]);  // t
+            double x1v     = static_cast<double>(src[5 * i + 1]);
+            double x2v     = static_cast<double>(src[5 * i + 2]);
+            dst[5 * i + 1] = std::sqrt(x1v * x1v + x2v * x2v);    // s
+            dst[5 * i + 2] = std::atan2(x2v, x1v);                 // theta
+            dst[5 * i + 3] = static_cast<double>(src[5 * i + 3]);  // zeta
+            dst[5 * i + 4] = static_cast<double>(src[5 * i + 4]);  // v_par
+        }
+        return result;
+    }
+}
+
+// Full Boozer-vacuum tracing loop: integrate each particle from t=0 to tmax.
+// loc: (n_points, 3) = [s, theta, zeta].
+// vpar: (n_points,).
+// Returns flat array of 5*n_points doubles: [t, s, theta, zeta, v_par] per particle.
+extern "C" py::array_t<double> metal_boozer_vacuum_tracing(
+    py::array_t<double> quad_pts,
+    py::array_t<double> x1_range, py::array_t<double> x2_range, py::array_t<double> x3_range,
+    py::array_t<double> loc, py::array_t<double> vpar,
+    double v_total, double m, double q, double psi0,
+    double tmax, double tol, int n_points)
+{
+    const double* x1   = static_cast<double*>(x1_range.request().ptr);
+    const double* x2   = static_cast<double*>(x2_range.request().ptr);
+    const double* x3   = static_cast<double*>(x3_range.request().ptr);
+    const double* qptr = static_cast<double*>(quad_pts.request().ptr);
+    const double* lptr = static_cast<double*>(loc.request().ptr);
+    const double* vptr = static_cast<double*>(vpar.request().ptr);
+
+    // Build constants: tol floored to f32-achievable level, tmax passed through.
+    DerivativeConstants dc = make_deriv_constants(x1, x2, x3, m, q, psi0, v_total, n_points);
+    dc.tol  = static_cast<float>(std::max(tol, 1e-5));
+    dc.tmax = static_cast<float>(tmax);
+
+    const std::vector<float> quad_f = to_f32(qptr, quad_pts.size());
+    const std::vector<float> loc_f  = to_f32(lptr, loc.size());
+    const std::vector<float> vpar_f = to_f32(vptr, n_points);
+
+    const size_t out_count = 5 * static_cast<size_t>(n_points);
+    auto& ctx = metal_context();
+
+    @autoreleasepool {
+        auto make_buf = [&](const void* data, size_t bytes) {
+            return [ctx.device newBufferWithBytes:data length:bytes
+                                         options:MTLResourceStorageModeShared];
+        };
+
+        id<MTLBuffer> quad_m = make_buf(quad_f.data(), quad_f.size() * sizeof(float));
+        id<MTLBuffer> loc_m  = make_buf(loc_f.data(),  loc_f.size()  * sizeof(float));
+        id<MTLBuffer> vpar_m = make_buf(vpar_f.data(), vpar_f.size() * sizeof(float));
+        id<MTLBuffer> out_m  = [ctx.device newBufferWithLength:out_count * sizeof(float)
+                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dc_m   = make_buf(&dc, sizeof(dc));
+
+        id<MTLCommandBuffer>         cb  = [ctx.queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:ctx.pipeline_tracing_boozer_vac];
+        [enc setBuffer:quad_m offset:0 atIndex:0];
+        [enc setBuffer:loc_m  offset:0 atIndex:1];
+        [enc setBuffer:vpar_m offset:0 atIndex:2];
+        [enc setBuffer:out_m  offset:0 atIndex:3];
+        [enc setBuffer:dc_m   offset:0 atIndex:4];
+
+        const NSUInteger total = static_cast<NSUInteger>(n_points);
+        const NSUInteger tpg   = std::min<NSUInteger>(
+            ctx.pipeline_tracing_boozer_vac.maxTotalThreadsPerThreadgroup, 256);
+        [enc dispatchThreads:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+
+        if (cb.status == MTLCommandBufferStatusError) {
+            std::string err = cb.error
+                ? std::string([[cb.error localizedDescription] UTF8String]) : "unknown";
+            throw std::runtime_error("Metal tracing dispatch failed: " + err);
+        }
+
         py::array_t<double> result(out_count);
         const float* src = static_cast<const float*>([out_m contents]);
         double*      dst = static_cast<double*>(result.request().ptr);

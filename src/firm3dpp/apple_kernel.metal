@@ -596,6 +596,110 @@ kernel void test_gpu_timestep_boozer_vacuum_kernel(
     out[5 * p + 4] = state[3];
 }
 
+// Full adaptive Dormand-Prince 5(4) tracing loop per particle, Boozer-vacuum mode.
+// Input loc: (n_points, 3) = [s, theta, zeta] (polar form).
+// Input vpar_buf: (n_points,) parallel velocity.
+// Output: (n_points, 5) = [t, x1, x2, zeta, v_par] at end of integration.
+//   Stops when t >= c.tmax or particle leaves domain (s >= 1).
+//   The wrapper converts (x1, x2) back to (s, theta) before returning to Python.
+kernel void boozer_vacuum_tracing_kernel(
+    device const float* quad_pts [[buffer(0)]],
+    device const float* loc      [[buffer(1)]],
+    device const float* vpar_buf [[buffer(2)]],
+    device float*       out      [[buffer(3)]],
+    constant DerivativeConstants& c [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    int p = int(gid);
+    if (p >= c.n_points) return;
+
+    float c1 = loc[3 * p + 0];
+    float ang = loc[3 * p + 1];
+    float c3 = loc[3 * p + 2];
+    float vpar_val = vpar_buf[p];
+
+    float state[4] = { c1 * cos(ang), c1 * sin(ang), c3, vpar_val };
+
+    float x_temp[5];
+    float derivs[42];
+    float x1_shape[4], x2_shape[4], x3_shape[4];
+    bool sym[1] = { false };
+    int ii[1], jj[1], kk[1];
+    float mu[1];
+    float t[1] = { 0.0f };
+    float dt[1] = { 0.0f };
+
+    f3d_build_state<F3D_RHS_BOOZER_VACUUM>(x_temp, 0, sym, ii, jj, kk,
+                                           x1_shape, x2_shape, x3_shape,
+                                           state, derivs, t, dt, c);
+    mu[0] = -1.0f;
+    f3d_calc_derivs<F3D_RHS_BOOZER_VACUUM>(quad_pts, derivs, 0, x_temp, sym, ii, jj, kk,
+                                            x1_shape, x2_shape, x3_shape, mu, 0, c);
+
+    float modB = derivs[4];
+    float G = derivs[5];
+    mu[0] = (c.v_total * c.v_total - vpar_val * vpar_val) / (2.0f * modB);
+
+    const float pi = 3.14159265358979f;
+    float dtmax_val = min((G / modB) * (0.5f * pi) / c.v_total, c.tmax);
+    dt[0] = 1e-3f * dtmax_val;
+
+    const float bhat1 = 71.0f / 57600.0f;
+    const float bhat3 = -71.0f / 16695.0f;
+    const float bhat4 = 71.0f / 1920.0f;
+    const float bhat5 = -17253.0f / 339200.0f;
+    const float bhat6 = 22.0f / 525.0f;
+    const float bhat7 = -1.0f / 40.0f;
+
+    bool lost = false;
+
+    while (t[0] < c.tmax && !lost) {
+        for (int k = 0; k < 7; ++k) {
+            f3d_build_state<F3D_RHS_BOOZER_VACUUM>(x_temp, k, sym, ii, jj, kk,
+                                                   x1_shape, x2_shape, x3_shape,
+                                                   state, derivs, t, dt, c);
+            f3d_calc_derivs<F3D_RHS_BOOZER_VACUUM>(quad_pts, derivs, k, x_temp, sym, ii, jj, kk,
+                                                    x1_shape, x2_shape, x3_shape, mu, 0, c);
+        }
+
+        float max_err = 0.0f;
+        for (int i = 0; i < 4; ++i) {
+            float err = dt[0] * (bhat1 * derivs[6*0 + i]
+                               + bhat3 * derivs[6*2 + i]
+                               + bhat4 * derivs[6*3 + i]
+                               + bhat5 * derivs[6*4 + i]
+                               + bhat6 * derivs[6*5 + i]
+                               + bhat7 * derivs[6*6 + i]);
+            err = fabs(err) / (c.tol + c.tol * (fabs(state[i]) + dt[0] * fabs(derivs[i])));
+            max_err = max(max_err, err);
+        }
+
+        float exponent = 0.0f;
+        if (max_err > 1.0f) exponent = -1.0f / 3.0f;
+        if (max_err < 0.5f) exponent = -1.0f / 5.0f;
+        float dt_new = dt[0] * 0.9f * pow(max_err, exponent);
+        dt_new = clamp(dt_new, 0.2f * dt[0], 5.0f * dt[0]);
+
+        if (max_err <= 1.0f) {
+            if (max_err > 0.5f) dt_new = dt[0];
+            t[0] += dt[0];
+            dt[0] = min(dt_new, c.tmax - t[0]);
+            for (int i = 0; i < 4; ++i) state[i] = x_temp[i + 1];
+
+            float s = sqrt(state[0] * state[0] + state[1] * state[1]);
+            lost = s >= 1.0f;
+        } else {
+            dt[0] = dt_new;
+        }
+    }
+
+    out[5 * p + 0] = t[0];
+    out[5 * p + 1] = state[0];
+    out[5 * p + 2] = state[1];
+    out[5 * p + 3] = state[2];
+    out[5 * p + 4] = state[3];
+}
+
 kernel void test_gpu_interpolation_kernel(
     device const float* quad_pts [[buffer(0)]],
     device const float* loc [[buffer(1)]],

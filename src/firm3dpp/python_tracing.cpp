@@ -34,6 +34,13 @@ extern "C" py::array_t<double> test_gpu_timestep_boozer_vacuum(
     double v_total, double m, double q, double psi0,
     double tol, int n_points);
 
+extern "C" py::array_t<double> metal_boozer_vacuum_tracing(
+    py::array_t<double> quad_pts,
+    py::array_t<double> x1_range, py::array_t<double> x2_range, py::array_t<double> x3_range,
+    py::array_t<double> loc, py::array_t<double> vpar,
+    double v_total, double m, double q, double psi0,
+    double tmax, double tol, int n_points);
+
 #endif
 
 #ifdef USE_CUDA
@@ -181,6 +188,12 @@ void init_tracing(py::module_ &m){
         py::arg("loc"), py::arg("vpar"),
         py::arg("v_total"), py::arg("m"), py::arg("q"), py::arg("psi0"),
         py::arg("tol"), py::arg("n_points"));
+
+    m.def("metal_boozer_vacuum_tracing", &metal_boozer_vacuum_tracing,
+        py::arg("quad_pts"), py::arg("x1_range"), py::arg("x2_range"), py::arg("x3_range"),
+        py::arg("loc"), py::arg("vpar"),
+        py::arg("v_total"), py::arg("m"), py::arg("q"), py::arg("psi0"),
+        py::arg("tmax"), py::arg("tol"), py::arg("n_points"));
 
 #endif
 

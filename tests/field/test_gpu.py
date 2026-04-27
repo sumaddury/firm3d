@@ -40,6 +40,9 @@ HAS_METAL_DERIV_CARTESIAN  = hasattr(firm3dpp, "test_gpu_derivatives_cartesian")
 # Metal timestep flags (one per mode as they are added incrementally).
 HAS_METAL_TIMESTEP_BOOZER_VAC = hasattr(firm3dpp, "test_gpu_timestep_boozer_vacuum")
 
+# Metal full tracing flags.
+HAS_METAL_TRACING_BOOZER_VAC = hasattr(firm3dpp, "metal_boozer_vacuum_tracing")
+
 HAS_GPU_TIMESTEP = all(
     hasattr(firm3dpp, name)
     for name in [
@@ -557,6 +560,58 @@ def run_timestep_check(field, nfp, stz, vpar, vtotal, psi0, time=None, saw_filen
 
     return error_is_small
 
+def run_tracing_check(field, nfp, stz, vpar, vtotal, psi0, tmax=1e-7, tol=1e-2):
+    srange, trange, zrange, quad_info, _ = construct_interpolant(field, nfp)
+
+    gc_tys, _ = trace_particles_boozer(
+        field,
+        stz,
+        vpar,
+        tmax=tmax,
+        mass=MASS,
+        charge=CHARGE,
+        Ekin=ENERGY,
+        tol=1e-9,
+        stopping_criteria=[],
+        dt_save=tmax / 10,
+    )
+
+    stz = np.ascontiguousarray(stz)
+    gpu_out = firm3dpp.metal_boozer_vacuum_tracing(
+        quad_pts=quad_info,
+        x1_range=srange,
+        x2_range=trange,
+        x3_range=zrange,
+        loc=stz.copy(),
+        vpar=vpar,
+        v_total=vtotal,
+        m=MASS,
+        q=CHARGE,
+        psi0=psi0,
+        tmax=tmax,
+        tol=1e-9,
+        n_points=stz.shape[0],
+    )
+    gpu_out = np.reshape(gpu_out, (stz.shape[0], 5))
+
+    # Map [t, s, theta, zeta, v_par] -> [t, s*cos(theta), s*sin(theta), zeta, v_par]
+    # so the angular ambiguity in theta doesn't affect the comparison.
+    cpu_final = np.array([x[-1] for x in gc_tys])
+    cpu_pos = np.array([[x[0], x[1]*np.cos(x[2]), x[1]*np.sin(x[2]), x[3], x[4]] for x in cpu_final])
+    gpu_pos = np.array([[x[0], x[1]*np.cos(x[2]), x[1]*np.sin(x[2]), x[3], x[4]] for x in gpu_out])
+
+    error = np.abs(cpu_pos - gpu_pos) / (np.abs(cpu_pos) + 1)
+    error_is_small = error.max() <= tol
+
+    if not error_is_small:
+        row_idx = np.unravel_index(np.argmax(error), error.shape)[0]
+        print("stz:", stz[row_idx, :])
+        print("cpu:", cpu_pos[row_idx, :])
+        print("gpu:", gpu_pos[row_idx, :])
+        print("error:", error[row_idx, :])
+
+    return error_is_small
+
 @unittest.skipUnless(
     HAS_GPU_INTERPOLATION, "No GPU interpolation backend (neither CUDA nor Metal) available"
 )
@@ -593,6 +648,14 @@ class TestGPUTracing(unittest.TestCase):
         timestep_tol = INTERP_TOL if IS_METAL_BACKEND else 1e-8
         is_small = run_timestep_check(field, nfp, stz, vpar_init, VELOCITY, field.psi0, tol=timestep_tol)
         self.assertTrue(is_small)
+
+        ### test full tracing loop (Metal only for now; use fewer points to keep runtime reasonable)
+        if HAS_METAL_TRACING_BOOZER_VAC and IS_METAL_BACKEND:
+            n_trace_pts = 100
+            stz_trace = sample_test_points(n_trace_pts)
+            vpar_trace = np.random.uniform(-VELOCITY, VELOCITY, (n_trace_pts,))
+            is_small = run_tracing_check(field, nfp, stz_trace, vpar_trace, VELOCITY, field.psi0)
+            self.assertTrue(is_small)
 
     def test_boozer_finite_beta(self):
         n_metagrid_pts = 15
