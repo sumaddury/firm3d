@@ -39,9 +39,11 @@ HAS_METAL_DERIV_CARTESIAN  = hasattr(firm3dpp, "test_gpu_derivatives_cartesian")
 
 # Metal timestep flags (one per mode as they are added incrementally).
 HAS_METAL_TIMESTEP_BOOZER_VAC = hasattr(firm3dpp, "test_gpu_timestep_boozer_vacuum")
+HAS_METAL_TIMESTEP_CARTESIAN  = hasattr(firm3dpp, "test_gpu_timestep_cartesian")
 
 # Metal full tracing flags.
 HAS_METAL_TRACING_BOOZER_VAC = hasattr(firm3dpp, "metal_boozer_vacuum_tracing")
+HAS_METAL_TRACING_CARTESIAN  = hasattr(firm3dpp, "metal_cartesian_vacuum_tracing")
 
 HAS_GPU_TIMESTEP = all(
     hasattr(firm3dpp, name)

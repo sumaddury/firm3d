@@ -53,6 +53,8 @@ struct MetalContext {
     id<MTLComputePipelineState> pipeline_derivs_cartesian     = nil;
     id<MTLComputePipelineState> pipeline_timestep_boozer_vac  = nil;
     id<MTLComputePipelineState> pipeline_tracing_boozer_vac   = nil;
+    id<MTLComputePipelineState> pipeline_timestep_cartesian   = nil;
+    id<MTLComputePipelineState> pipeline_tracing_cartesian    = nil;
 };
 
 static std::string load_file(const std::string& path) {
@@ -113,6 +115,8 @@ static MetalContext& metal_context() {
             local.pipeline_derivs_cartesian    = make_pipeline(local.device, lib, @"test_gpu_derivs_cartesian_kernel");
             local.pipeline_timestep_boozer_vac = make_pipeline(local.device, lib, @"test_gpu_timestep_boozer_vacuum_kernel");
             local.pipeline_tracing_boozer_vac  = make_pipeline(local.device, lib, @"boozer_vacuum_tracing_kernel");
+            local.pipeline_timestep_cartesian  = make_pipeline(local.device, lib, @"test_gpu_timestep_cartesian_kernel");
+            local.pipeline_tracing_cartesian   = make_pipeline(local.device, lib, @"cartesian_vacuum_tracing_kernel");
         }
         return local;
     }();
@@ -575,5 +579,154 @@ extern "C" py::array_t<double> test_gpu_derivatives_cartesian(
         to_f32(vptr, n_points),
         to_f32(tptr, n_points),
         dc);
+}
+
+// One adaptive DP5 step per particle, Cartesian-vacuum mode.
+// loc: (n_points, 3) = [r, phi, z].
+// vpar: (n_points,).
+// Returns flat array of 5*n_points doubles: [t, x, y, z, v_par] per particle.
+// No coordinate conversion: kernel output is already in Cartesian form.
+extern "C" py::array_t<double> test_gpu_timestep_cartesian(
+    py::array_t<double> quad_pts,
+    py::array_t<double> x1_range, py::array_t<double> x2_range, py::array_t<double> x3_range,
+    py::array_t<double> loc, py::array_t<double> vpar,
+    double v_total, double m, double q,
+    double tol, int n_points)
+{
+    const double* x1   = static_cast<double*>(x1_range.request().ptr);
+    const double* x2   = static_cast<double*>(x2_range.request().ptr);
+    const double* x3   = static_cast<double*>(x3_range.request().ptr);
+    const double* qptr = static_cast<double*>(quad_pts.request().ptr);
+    const double* lptr = static_cast<double*>(loc.request().ptr);
+    const double* vptr = static_cast<double*>(vpar.request().ptr);
+
+    // psi0 unused in Cartesian; make_timestep_constants floors tol and sets tmax=1e-2.
+    const DerivativeConstants dc = make_timestep_constants(x1, x2, x3, m, q, 0.0, v_total, tol, n_points);
+
+    const std::vector<float> quad_f = to_f32(qptr, quad_pts.size());
+    const std::vector<float> loc_f  = to_f32(lptr, loc.size());
+    const std::vector<float> vpar_f = to_f32(vptr, n_points);
+
+    const size_t out_count = 5 * static_cast<size_t>(n_points);
+    auto& ctx = metal_context();
+
+    @autoreleasepool {
+        auto make_buf = [&](const void* data, size_t bytes) {
+            return [ctx.device newBufferWithBytes:data length:bytes
+                                         options:MTLResourceStorageModeShared];
+        };
+
+        id<MTLBuffer> quad_m = make_buf(quad_f.data(), quad_f.size() * sizeof(float));
+        id<MTLBuffer> loc_m  = make_buf(loc_f.data(),  loc_f.size()  * sizeof(float));
+        id<MTLBuffer> vpar_m = make_buf(vpar_f.data(), vpar_f.size() * sizeof(float));
+        id<MTLBuffer> out_m  = [ctx.device newBufferWithLength:out_count * sizeof(float)
+                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dc_m   = make_buf(&dc, sizeof(dc));
+
+        id<MTLCommandBuffer>         cb  = [ctx.queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:ctx.pipeline_timestep_cartesian];
+        [enc setBuffer:quad_m offset:0 atIndex:0];
+        [enc setBuffer:loc_m  offset:0 atIndex:1];
+        [enc setBuffer:vpar_m offset:0 atIndex:2];
+        [enc setBuffer:out_m  offset:0 atIndex:3];
+        [enc setBuffer:dc_m   offset:0 atIndex:4];
+
+        const NSUInteger total = static_cast<NSUInteger>(n_points);
+        const NSUInteger tpg   = std::min<NSUInteger>(
+            ctx.pipeline_timestep_cartesian.maxTotalThreadsPerThreadgroup, 256);
+        [enc dispatchThreads:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+
+        if (cb.status == MTLCommandBufferStatusError) {
+            std::string err = cb.error
+                ? std::string([[cb.error localizedDescription] UTF8String]) : "unknown";
+            throw std::runtime_error("Metal Cartesian timestep dispatch failed: " + err);
+        }
+
+        // Straight f32 -> f64 copy; kernel output is already [t, x, y, z, v_par].
+        py::array_t<double> result(out_count);
+        const float* src = static_cast<const float*>([out_m contents]);
+        double*      dst = static_cast<double*>(result.request().ptr);
+        for (size_t i = 0; i < out_count; ++i) dst[i] = static_cast<double>(src[i]);
+        return result;
+    }
+}
+
+// Full Cartesian-vacuum tracing loop: integrate each particle from t=0 to tmax.
+// loc: (n_points, 3) = [r, phi, z].
+// vpar: (n_points,).
+// Returns flat array of 5*n_points doubles: [t, x, y, z, v_par] per particle.
+// No coordinate conversion: kernel output is already in Cartesian form.
+extern "C" py::array_t<double> metal_cartesian_vacuum_tracing(
+    py::array_t<double> quad_pts,
+    py::array_t<double> x1_range, py::array_t<double> x2_range, py::array_t<double> x3_range,
+    py::array_t<double> loc, py::array_t<double> vpar,
+    double v_total, double m, double q,
+    double tmax, double tol, int n_points)
+{
+    const double* x1   = static_cast<double*>(x1_range.request().ptr);
+    const double* x2   = static_cast<double*>(x2_range.request().ptr);
+    const double* x3   = static_cast<double*>(x3_range.request().ptr);
+    const double* qptr = static_cast<double*>(quad_pts.request().ptr);
+    const double* lptr = static_cast<double*>(loc.request().ptr);
+    const double* vptr = static_cast<double*>(vpar.request().ptr);
+
+    DerivativeConstants dc = make_deriv_constants(x1, x2, x3, m, q, 0.0, v_total, n_points);
+    dc.tol  = static_cast<float>(std::max(tol, 1e-5));
+    dc.tmax = static_cast<float>(tmax);
+
+    const std::vector<float> quad_f = to_f32(qptr, quad_pts.size());
+    const std::vector<float> loc_f  = to_f32(lptr, loc.size());
+    const std::vector<float> vpar_f = to_f32(vptr, n_points);
+
+    const size_t out_count = 5 * static_cast<size_t>(n_points);
+    auto& ctx = metal_context();
+
+    @autoreleasepool {
+        auto make_buf = [&](const void* data, size_t bytes) {
+            return [ctx.device newBufferWithBytes:data length:bytes
+                                         options:MTLResourceStorageModeShared];
+        };
+
+        id<MTLBuffer> quad_m = make_buf(quad_f.data(), quad_f.size() * sizeof(float));
+        id<MTLBuffer> loc_m  = make_buf(loc_f.data(),  loc_f.size()  * sizeof(float));
+        id<MTLBuffer> vpar_m = make_buf(vpar_f.data(), vpar_f.size() * sizeof(float));
+        id<MTLBuffer> out_m  = [ctx.device newBufferWithLength:out_count * sizeof(float)
+                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dc_m   = make_buf(&dc, sizeof(dc));
+
+        id<MTLCommandBuffer>         cb  = [ctx.queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:ctx.pipeline_tracing_cartesian];
+        [enc setBuffer:quad_m offset:0 atIndex:0];
+        [enc setBuffer:loc_m  offset:0 atIndex:1];
+        [enc setBuffer:vpar_m offset:0 atIndex:2];
+        [enc setBuffer:out_m  offset:0 atIndex:3];
+        [enc setBuffer:dc_m   offset:0 atIndex:4];
+
+        const NSUInteger total = static_cast<NSUInteger>(n_points);
+        const NSUInteger tpg   = std::min<NSUInteger>(
+            ctx.pipeline_tracing_cartesian.maxTotalThreadsPerThreadgroup, 256);
+        [enc dispatchThreads:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+
+        if (cb.status == MTLCommandBufferStatusError) {
+            std::string err = cb.error
+                ? std::string([[cb.error localizedDescription] UTF8String]) : "unknown";
+            throw std::runtime_error("Metal Cartesian tracing dispatch failed: " + err);
+        }
+
+        // Straight f32 -> f64 copy; kernel output is already [t, x, y, z, v_par].
+        py::array_t<double> result(out_count);
+        const float* src = static_cast<const float*>([out_m contents]);
+        double*      dst = static_cast<double*>(result.request().ptr);
+        for (size_t i = 0; i < out_count; ++i) dst[i] = static_cast<double>(src[i]);
+        return result;
+    }
 }
 
