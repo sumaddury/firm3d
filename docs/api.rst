@@ -1,10 +1,10 @@
 API Reference
-============
+=============
 
 This page provides detailed API documentation for the main FIRM3D modules and classes.
 
 Magnetic Field Classes
----------------------
+----------------------
 
 .. automodule:: firm3d.field.boozermagneticfield
    :members:
@@ -17,24 +17,44 @@ Magnetic Field Classes
    :show-inheritance:
 
 Trajectory Integration
----------------------
+----------------------
 
-.. automodule:: firm3d.field.trajectory_helpers
+.. automodule:: firm3d.field.tracing
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
+.. automodule:: firm3d.trajectory_helpers
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
+Coulomb Collisions
+------------------
+
+.. automodule:: firm3d.field.collisions
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
+GPU Tracing
+-----------
+
+.. automodule:: firm3d.catapult.tracing
    :members:
    :undoc-members:
    :show-inheritance:
 
 Stopping Criteria
-----------------
+-----------------
 
-# Note: This module may not exist yet in the current codebase
-# .. automodule:: firm3d.field.stopping_criteria
-#    :members:
-#    :undoc-members:
-#    :show-inheritance:
+Stopping criteria (``MaxToroidalFluxStoppingCriterion``,
+``MinToroidalFluxStoppingCriterion``, ``ToroidalTransitStoppingCriterion``,
+``IterationStoppingCriterion``, ``StepSizeStoppingCriterion``) are defined in
+``firm3d.field.tracing`` and documented above.
 
 Shear Alfvén Wave Classes
-------------------------
+-------------------------
 
 # Note: This module may not exist yet in the current codebase
 # .. automodule:: firm3d.field.shear_alfven_waves
@@ -43,7 +63,7 @@ Shear Alfvén Wave Classes
 #    :show-inheritance:
 
 Utility Functions
-----------------
+-----------------
 
 .. automodule:: firm3d.util.constants
    :members:
@@ -56,7 +76,7 @@ Utility Functions
    :show-inheritance:
 
 Plotting Utilities
------------------
+------------------
 
 .. automodule:: firm3d.plotting.plotting_helpers
    :members:
@@ -64,7 +84,7 @@ Plotting Utilities
    :show-inheritance:
 
 Core Types and Utilities
------------------------
+-------------------------
 
 .. automodule:: firm3d._core.types
    :members:
@@ -77,7 +97,7 @@ Core Types and Utilities
    :show-inheritance:
 
 SAW (Shear Alfvén Wave) Module
------------------------------
+------------------------------
 
 .. automodule:: firm3d.saw.ae3d
    :members:
@@ -90,12 +110,12 @@ SAW (Shear Alfvén Wave) Module
    :show-inheritance:
 
 Class Hierarchy
---------------
+---------------
 
 .. inheritance-diagram:: firm3d.field.boozermagneticfield
    :parts: 1
 
-.. inheritance-diagram:: firm3d.field.trajectory_helpers
+.. inheritance-diagram:: firm3d.trajectory_helpers
    :parts: 1
 
 # .. inheritance-diagram:: firm3d.field.stopping_criteria
@@ -132,8 +152,6 @@ Class Hierarchy
 #    # firm3d.field.stopping_criteria.StoppingCriterion
 #    # firm3d.field.stopping_criteria.MaxToroidalFluxStoppingCriterion
 #    # firm3d.field.stopping_criteria.MinToroidalFluxStoppingCriterion
-#    # firm3d.field.stopping_criteria.ZetaStoppingCriterion
-#    # firm3d.field.stopping_criteria.VparStoppingCriterion
 #    # firm3d.field.stopping_criteria.ToroidalTransitStoppingCriterion
 #    # firm3d.field.stopping_criteria.IterationStoppingCriterion
 #    # firm3d.field.stopping_criteria.StepSizeStoppingCriterion
@@ -163,3 +181,16 @@ Class Hierarchy
 #    firm3d.saw
 #    firm3d.saw.ae3d
 #    firm3d.saw.stellgap
+
+GPU tracing (CATAPULT)
+----------------------
+
+.. automodule:: firm3d.catapult.field
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
+.. automodule:: firm3d.catapult.tracing
+   :members:
+   :undoc-members:
+   :show-inheritance:

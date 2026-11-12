@@ -2,31 +2,73 @@ cmake_minimum_required(VERSION 3.15)
 set(CMAKE_CXX_COMPILER_WORKS 1)
 project(firm3dpp)
 
-include(CheckLanguage)
-check_language(CUDA)
-check_language(OBJCXX)
+# GPU bindings need nvcc plus cuda_runtime.h visible to the host C++ compiler
+# (cuda_wrapper.cpp is host-compiled). CMake never emits -I/usr/include, so a
+# distro toolkit with headers there is invisible to conda's compilers.
+option(USE_CUDA "Build the GPU bindings when a CUDA toolkit is available" ON)
 
-if(CMAKE_CUDA_COMPILER)
-    enable_language(CUDA)
-    find_package(CUDAToolkit)
-    add_definitions(-DUSE_CUDA)
-
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -arch=native")
-    set(CUDA_TARGETS  src/firm3dpp/cuda_kernel.cu src/firm3dpp/cuda_wrapper.cpp)
-    message(STATUS "CUDA found. GPU bindings will be compiled.")
+set(CUDA_TARGETS)
+if(NOT USE_CUDA)
+    set(_cuda_skip "USE_CUDA=OFF")
 else()
-    set(CUDA_TARGETS) 
-    message(STATUS "CUDA not found. GPU bindings will be skipped.")
+    find_package(CUDAToolkit QUIET)
+    include(CheckLanguage)
+    check_language(CUDA)
+    if(CMAKE_CUDA_COMPILER)
+        include(CheckIncludeFileCXX)
+        set(CMAKE_REQUIRED_INCLUDES ${CUDAToolkit_INCLUDE_DIRS})
+        check_include_file_cxx(cuda_runtime.h HAVE_CUDA_RUNTIME_H)
+        unset(CMAKE_REQUIRED_INCLUDES)
+    endif()
+    if(NOT CMAKE_CUDA_COMPILER)
+        set(_cuda_skip "nvcc not found")
+    elseif(NOT HAVE_CUDA_RUNTIME_H)
+        set(_cuda_skip "${CMAKE_CXX_COMPILER} cannot include cuda_runtime.h from '${CUDAToolkit_INCLUDE_DIRS}'; try CC=gcc CXX=g++")
+    endif()
 endif()
 
-if(APPLE AND CMAKE_OBJCXX_COMPILER)
-    enable_language(OBJCXX)
-    add_definitions(-DUSE_METAL)
-    set(METAL_TARGETS src/firm3dpp/metal_wrapper.mm)
+if(DEFINED _cuda_skip)
+    message(STATUS "GPU bindings skipped: ${_cuda_skip}")
+else()
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        find_program(NVIDIA_SMI nvidia-smi)
+        if(NVIDIA_SMI)
+            execute_process(COMMAND ${NVIDIA_SMI} --query-gpu=compute_cap --format=csv,noheader
+                            OUTPUT_VARIABLE _gpu_caps RESULT_VARIABLE _smi_result
+                            OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+        endif()
+        if(_smi_result EQUAL 0 AND _gpu_caps MATCHES "^[0-9]+\\.[0-9]+")
+            string(REPLACE "." "" _gpu_caps "${_gpu_caps}")
+            string(REPLACE "\n" ";" _gpu_caps "${_gpu_caps}")
+            list(REMOVE_DUPLICATES _gpu_caps)
+            set(CMAKE_CUDA_ARCHITECTURES ${_gpu_caps})
+        elseif(CMAKE_VERSION VERSION_GREATER_EQUAL 3.23)
+            set(CMAKE_CUDA_ARCHITECTURES all-major)
+        else()
+            message(WARNING "No GPU detected and CMake < 3.23; using nvcc's default CUDA architecture.")
+        endif()
+    endif()
+    message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
+    enable_language(CUDA)
+    add_definitions(-DUSE_CUDA)
+    include_directories(${CUDAToolkit_INCLUDE_DIRS})
+    
+    set(CUDA_TARGETS src/firm3dpp/cuda_kernel.cu src/firm3dpp/cuda_wrapper.cpp)
+    message(STATUS "GPU bindings will be compiled with ${CMAKE_CUDA_COMPILER} (CUDA ${CUDAToolkit_VERSION})")
+endif()
+
+option(USE_METAL "Build the Apple Metal GPU bindings if available" ON)
+
+if(APPLE AND USE_METAL)
+    include(CheckLanguage)
+    check_language(OBJCXX)
 
     find_library(METAL_FRAMEWORK Metal)
     find_library(FOUNDATION_FRAMEWORK Foundation)
-    if(METAL_FRAMEWORK AND FOUNDATION_FRAMEWORK)
+    if(CMAKE_OBJCXX_COMPILER AND METAL_FRAMEWORK AND FOUNDATION_FRAMEWORK)
+        enable_language(OBJCXX)
+        add_definitions(-DUSE_METAL)
+        set(METAL_TARGETS src/firm3dpp/metal_wrapper.mm)
         set(METAL_LIBRARIES ${METAL_FRAMEWORK} ${FOUNDATION_FRAMEWORK})
         message(STATUS "Apple Metal found. Metal bindings will be compiled.")
     else()
@@ -65,7 +107,7 @@ else()
 endif()
 
 # Find pybind11
-execute_process(COMMAND python -m pybind11 --cmakedir
+execute_process(COMMAND ${Python_EXECUTABLE} -m pybind11 --cmakedir
                 OUTPUT_VARIABLE pybind11_DIR
                 OUTPUT_STRIP_TRAILING_WHITESPACE)
 message("Result of python -m pybind11 --cmakedir: ${pybind11_DIR}")
@@ -77,7 +119,7 @@ if(GIT_FOUND AND EXISTS "${PROJECT_SOURCE_DIR}/.git")
     option(GIT_SUBMODULE "Check submodules during build" ON)
     if(GIT_SUBMODULE)
         message(STATUS "Submodule update")
-        execute_process(COMMAND ${GIT_EXECUTABLE} submodule update --init --recursive
+        execute_process(COMMAND ${GIT_EXECUTABLE} submodule update --init
                         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
                         RESULT_VARIABLE GIT_SUBMOD_RESULT)
         if(NOT GIT_SUBMOD_RESULT EQUAL "0")
@@ -129,7 +171,110 @@ if(DEFINED ENV{CONDA_PREFIX})
 endif()
 
 find_package(OpenMP)
-find_package(Boost 1.76.0)
+
+# Find MPI (optional, for parallel interpolation)
+find_package(MPI QUIET)
+if(MPI_FOUND AND MPI_CXX_FOUND)
+    # Cray PE wrappers (cc/CC) absorb MPI include paths internally, so FindMPI
+    # leaves MPI_CXX_INCLUDE_DIRS empty. Recover the path from CRAY_MPICH_DIR.
+    if(NOT MPI_CXX_INCLUDE_DIRS AND DEFINED ENV{CRAY_MPICH_DIR})
+        set(MPI_CXX_INCLUDE_DIRS "$ENV{CRAY_MPICH_DIR}/include")
+        set_property(TARGET MPI::MPI_CXX PROPERTY
+            INTERFACE_INCLUDE_DIRECTORIES "$ENV{CRAY_MPICH_DIR}/include")
+        message(STATUS "Cray MPI: recovered include dirs from CRAY_MPICH_DIR")
+    endif()
+    message(STATUS "MPI found: ${MPI_VERSION}")
+    message(STATUS "MPI CXX compiler: ${MPI_CXX_COMPILER}")
+    message(STATUS "MPI CXX include dirs: ${MPI_CXX_INCLUDE_DIRS}")
+    message(STATUS "MPI CXX libraries: ${MPI_CXX_LIBRARIES}")
+    set(USE_MPI TRUE)
+    add_definitions(-DUSE_MPI)
+else()
+    message(STATUS "MPI not found. MPI parallelization will be disabled.")
+    message(STATUS "To enable MPI, install MPI development libraries and ensure MPI_CXX_COMPILER is set.")
+    set(USE_MPI FALSE)
+endif()
+
+set(BOOST_MINIMUM_VERSION 1.76.0)
+set(_boost_user_include_dir "${Boost_INCLUDE_DIR}")
+
+# Preferred route: an install that ships BoostConfig.cmake.
+find_package(Boost ${BOOST_MINIMUM_VERSION} QUIET)
+if(Boost_FOUND AND NOT Boost_INCLUDE_DIRS)
+    message(STATUS "find_package(Boost) provided no include dirs. Searching for headers instead.")
+    set(Boost_FOUND FALSE)
+elseif(Boost_FOUND)
+    message(STATUS "Boost located by find_package.")
+endif()
+
+# CMake deprecated FindBoost in 3.30 (CMP0167) and is retiring it, after which
+# the call above only succeeds in CONFIG mode against an install that ships
+# BoostConfig.cmake. Header-only installs (conda, pip, some system packages)
+# ship no such config, and where FindBoost still runs it may see nothing but a
+# too-old system Boost. Either way the download below would be triggered on
+# every fresh configure, so locate the headers directly instead.
+if(NOT Boost_FOUND)
+    unset(Boost_INCLUDE_DIR CACHE)
+    set(_boost_hints)
+    if(_boost_user_include_dir)
+        list(APPEND _boost_hints "${_boost_user_include_dir}")
+    endif()
+    foreach(_boost_root "${BOOST_ROOT}" "${BOOSTROOT}" "$ENV{BOOST_ROOT}"
+                        "$ENV{BOOSTROOT}" "$ENV{CONDA_PREFIX}")
+        if(_boost_root)
+            list(APPEND _boost_hints "${_boost_root}/include" "${_boost_root}")
+        endif()
+    endforeach()
+    if(Python_EXECUTABLE)
+        get_filename_component(_python_prefix "${Python_EXECUTABLE}" DIRECTORY)
+        get_filename_component(_python_prefix "${_python_prefix}" DIRECTORY)
+        list(APPEND _boost_hints "${_python_prefix}/include")
+    endif()
+
+    find_path(Boost_INCLUDE_DIR
+        NAMES boost/version.hpp
+        HINTS ${_boost_hints}
+        PATHS /usr/local/include /usr/include /opt/local/include /opt/homebrew/include
+        DOC "Directory holding the Boost header tree (the parent of boost/)")
+
+    set(_boost_version_string)
+    if(Boost_INCLUDE_DIR AND EXISTS "${Boost_INCLUDE_DIR}/boost/version.hpp")
+        file(STRINGS "${Boost_INCLUDE_DIR}/boost/version.hpp" _boost_version_line
+             REGEX "^#define[ \t]+BOOST_VERSION[ \t]+[0-9]+")
+        if(_boost_version_line MATCHES "BOOST_VERSION[ \t]+([0-9]+)")
+            # BOOST_VERSION is encoded as major * 100000 + minor * 100 + patch.
+            math(EXPR _boost_major "${CMAKE_MATCH_1} / 100000")
+            math(EXPR _boost_minor "${CMAKE_MATCH_1} / 100 % 1000")
+            math(EXPR _boost_patch "${CMAKE_MATCH_1} % 100")
+            set(_boost_version_string "${_boost_major}.${_boost_minor}.${_boost_patch}")
+        endif()
+    endif()
+
+    # Minimal installs sometimes ship a partial tree, so check that the headers
+    # firm3d actually includes are present before trusting the discovery.
+    set(_boost_missing_headers)
+    foreach(_header boost/format.hpp boost/math/tools/roots.hpp boost/numeric/odeint.hpp)
+        if(NOT EXISTS "${Boost_INCLUDE_DIR}/${_header}")
+            list(APPEND _boost_missing_headers "${_header}")
+        endif()
+    endforeach()
+
+    if(NOT Boost_INCLUDE_DIR OR NOT EXISTS "${Boost_INCLUDE_DIR}/boost/version.hpp")
+        message(STATUS "No Boost headers found in BOOST_ROOT, CMAKE_PREFIX_PATH, the Python prefix or the system paths.")
+    elseif(NOT _boost_version_string)
+        message(STATUS "Could not read a Boost version from ${Boost_INCLUDE_DIR}/boost/version.hpp.")
+    elseif(_boost_version_string VERSION_LESS ${BOOST_MINIMUM_VERSION})
+        message(STATUS "Boost ${_boost_version_string} in ${Boost_INCLUDE_DIR} is older than the required ${BOOST_MINIMUM_VERSION}.")
+    elseif(_boost_missing_headers)
+        message(STATUS "Boost headers in ${Boost_INCLUDE_DIR} are incomplete, missing ${_boost_missing_headers}.")
+    else()
+        set(Boost_FOUND TRUE)
+        set(Boost_VERSION_STRING ${_boost_version_string})
+        set(Boost_INCLUDE_DIRS ${Boost_INCLUDE_DIR})
+        message(STATUS "Boost located by header search (find_package found no usable package).")
+    endif()
+endif()
+
 if(Boost_FOUND)
     message(STATUS "Boost version is ${Boost_VERSION_STRING}")
     message(STATUS "Boost include dirs are ${Boost_INCLUDE_DIRS}")
@@ -200,7 +345,13 @@ set_target_properties(${PROJECT_NAME}
     CXX_STANDARD 17
     CXX_STANDARD_REQUIRED ON)
 
-target_include_directories(${PROJECT_NAME} PRIVATE "thirdparty/xtensor/include" "thirdparty/xtensor-python/include" "thirdparty/xsimd/include" "thirdparty/xtl/include" ${Python_NumPy_INCLUDE_DIRS} "src/firm3dpp/")
+# nlohmann-json is provided via the Python nlohmann_json package.
+# setup.py finds the include path and passes it to CMake.
+if(nlohmann_json_INCLUDE_DIR)
+    target_include_directories(${PROJECT_NAME} PRIVATE "thirdparty/xtensor/include" "thirdparty/xtensor-python/include" "thirdparty/xsimd/include" "thirdparty/xtl/include" ${Python_NumPy_INCLUDE_DIRS} "src/firm3dpp/" ${nlohmann_json_INCLUDE_DIR})
+else()
+    target_include_directories(${PROJECT_NAME} PRIVATE "thirdparty/xtensor/include" "thirdparty/xtensor-python/include" "thirdparty/xsimd/include" "thirdparty/xtl/include" ${Python_NumPy_INCLUDE_DIRS} "src/firm3dpp/")
+endif()
 
 if(NOT Boost_FOUND)
     add_dependencies(${PROJECT_NAME} ${boost_target})
@@ -209,6 +360,12 @@ set_target_properties(${PROJECT_NAME} PROPERTIES COMPILE_FLAGS "-I${Boost_INCLUD
 
 if(OpenMP_CXX_FOUND)
     target_link_libraries(${PROJECT_NAME} PRIVATE OpenMP::OpenMP_CXX)
+endif()
+
+# Link MPI if found
+if(USE_MPI AND MPI_CXX_FOUND)
+    target_link_libraries(${PROJECT_NAME} PRIVATE MPI::MPI_CXX)
+    message(STATUS "Linking MPI libraries for parallel interpolation support")
 endif()
 
 if(METAL_LIBRARIES)

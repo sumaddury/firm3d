@@ -4,7 +4,6 @@ import numpy as np
 
 from firm3d._core.util import parallel_loop_bounds
 from firm3d.field.boozermagneticfield import (
-    BoozerRadialInterpolant,
     InterpolatedBoozerField,
 )
 from firm3d.field.tracing import (
@@ -15,7 +14,7 @@ from firm3d.field.tracing_helpers import (
     initialize_position_uniform_vol,
     initialize_velocity_uniform,
 )
-from firm3d.field.trajectory_helpers import compute_peta
+from firm3d.trajectory_helpers import compute_peta
 from firm3d.util.constants import (
     ALPHA_PARTICLE_CHARGE,
     ALPHA_PARTICLE_MASS,
@@ -40,21 +39,11 @@ setup_logging(f"stdout_resolution_scan_{comm_size}.txt")
 Ekin = FUSION_ALPHA_PARTICLE_ENERGY
 mass = ALPHA_PARTICLE_MASS
 charge = ALPHA_PARTICLE_CHARGE
-# Initialize uniformly distributed parallel velocities
-vpar0 = np.sqrt(2 * Ekin / mass)
+# Isotropic pitch angle: v_par/v drawn uniformly in [-1, 1] at fixed birth energy
+v0 = np.sqrt(2 * Ekin / mass)
 vpar_init = initialize_velocity_uniform(
-    vpar0,
+    v0,
     nParticles,
-)
-
-## Setup radial interpolation with quasisymmetry explicitly enforced
-bri = BoozerRadialInterpolant(
-    boozmn_filename,
-    order,
-    no_K=True,
-    comm=comm_world,
-    helicity_M=helicity_M,
-    helicity_N=helicity_N,
 )
 
 resolutions = np.array([16, 32, 48, 64, 80, 96])
@@ -81,13 +70,16 @@ for i in range(len(resolutions)):
     ntheta_interp = resolution
     nzeta_interp = resolution
 
-    ## Setup 3d interpolation
-    field = InterpolatedBoozerField(
-        bri,
-        degree,
-        ns_interp=ns_interp,
-        ntheta_interp=ntheta_interp,
-        nzeta_interp=nzeta_interp,
+    ## Setup field interpolation with quasisymmetry explicitly enforced
+    field = InterpolatedBoozerField.from_booz_xform(
+        boozmn_filename,
+        degree=order,
+        ns=ns_interp,
+        ntheta=ntheta_interp,
+        nzeta=nzeta_interp,
+        helicity_M=helicity_M,
+        helicity_N=helicity_N,
+        comm=comm_world,
     )
 
     points_init = initialize_position_uniform_vol(

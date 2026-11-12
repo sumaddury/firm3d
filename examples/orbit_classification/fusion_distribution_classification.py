@@ -5,7 +5,6 @@ import numpy as np
 
 from firm3d._core.util import parallel_loop_bounds
 from firm3d.field.boozermagneticfield import (
-    BoozerRadialInterpolant,
     InterpolatedBoozerField,
 )
 from firm3d.field.tracing import (
@@ -22,7 +21,7 @@ from firm3d.util.constants import (
     ALPHA_PARTICLE_MASS,
     FUSION_ALPHA_PARTICLE_ENERGY,
 )
-from firm3d.util.functions import proc0_print
+from firm3d.util.functions import in_github_actions, proc0_print, sigmav
 
 try:
     from mpi4py import MPI
@@ -37,14 +36,14 @@ except ImportError:
 
 time1 = time.time()
 
-resolution = 48  # Resolution for field interpolation
-nParticles = 5000  # Number of particles to trace
-reltol = 1e-8  # Relative tolerance for the ODE solver
-abstol = 1e-8  # Absolute tolerance for the ODE solver
+resolution = 10 if in_github_actions else 48  # Resolution for field interpolation
+nParticles = 50 if in_github_actions else 5000  # Number of particles to trace
+reltol = 1e-4 if in_github_actions else 1e-8  # Relative tolerance for the ODE solver
+abstol = 1e-4 if in_github_actions else 1e-8  # Absolute tolerance for the ODE solver
 order = 3  # Order for radial interpolation
 degree = 3  # Degree for 3d interpolation
 boozmn_filename = "../inputs/boozmn_ariescs.nc"
-tmax = 1e-2  # Time for integration
+tmax = 1e-4 if in_github_actions else 1e-2  # Time for integration
 ns_interp = resolution
 ntheta_interp = resolution
 nzeta_interp = resolution
@@ -59,34 +58,25 @@ stdout_file = open(  # noqa: SIM115
 )
 sys.stdout = stdout_file
 
-## Setup radial interpolation
-bri = BoozerRadialInterpolant(boozmn_filename, order, no_K=True, comm=comm)
-
-## Setup 3d interpolation
-field = InterpolatedBoozerField(
-    bri,
-    degree,
-    ns_interp=ns_interp,
-    ntheta_interp=ntheta_interp,
-    nzeta_interp=nzeta_interp,
+## Setup field interpolation
+field = InterpolatedBoozerField.from_booz_xform(
+    boozmn_filename,
+    degree=order,
+    ns=ns_interp,
+    ntheta=ntheta_interp,
+    nzeta=nzeta_interp,
+    comm=comm,
 )
 
 # Define fusion birth distribution
 # Bader, A., et al. "Modeling of energetic particle transport in optimized
 # stellarators." Nuclear Fusion 61.11 (2021): 116060.
-nD = lambda s: (1 - s**5)  # Normalized density
+nD = lambda s: 1 - s**5  # Normalized density
 nT = nD
 T = lambda s: 11.5 * (1 - s)  # Temperature in keV
 
 
 # D-T cross-section
-def sigmav(T):
-    if T > 0:
-        return T ** (-2 / 3) * np.exp(-19.94 * T ** (-1 / 3))
-    else:
-        return 0
-
-
 # Reactivity profile
 reactivity = lambda s: nD(s) * nT(s) * sigmav(T(s))
 
@@ -97,9 +87,9 @@ points_init = initialize_position_profile(
 Ekin = FUSION_ALPHA_PARTICLE_ENERGY
 mass = ALPHA_PARTICLE_MASS
 charge = ALPHA_PARTICLE_CHARGE
-# Initialize uniformly distributed parallel velocities
-vpar0 = np.sqrt(2 * Ekin / mass)
-vpar_init = initialize_velocity_uniform(vpar0, nParticles, comm=comm, seed=0)
+# Isotropic pitch angle: v_par/v drawn uniformly in [-1, 1] at fixed birth energy
+v0 = np.sqrt(2 * Ekin / mass)
+vpar_init = initialize_velocity_uniform(v0, nParticles, comm=comm, seed=0)
 
 first, last = parallel_loop_bounds(comm, nParticles)
 for iParticle in range(first, last):

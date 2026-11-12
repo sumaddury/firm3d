@@ -1,0 +1,195 @@
+name: Perlmutter GPU CI
+
+# Runs GPU tests on NERSC Perlmutter via a self-hosted Actions runner.
+# The runner must be running on a Perlmutter login node; see
+# install/perlmutter/setup_ci_env.sh for the one-time environment setup.
+#
+# Required: NERSC_ACCOUNT GitHub secret (SLURM project account, e.g. m4505)
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    types: [labeled, synchronize]
+
+jobs:
+  perlmutter-gpu:
+    if: >
+      github.event_name == 'push' ||
+      contains(github.event.pull_request.labels.*.name, 'GPU CI')
+    runs-on: [perlmutter]
+    timeout-minutes: 360
+    permissions:
+      pull-requests: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Submit SLURM job and wait
+        id: slurm
+        env:
+          NERSC_ACCOUNT: ${{ secrets.NERSC_ACCOUNT }}
+          GH_SHA: ${{ github.sha }}
+          WORK_DIR: ${{ runner.temp }}/firm3d-${{ github.sha }}
+        run: |
+          mkdir -p "$WORK_DIR"
+          cp .github/scripts/run_gpu_tests.sh "$WORK_DIR/run_gpu_tests.sh"
+
+          JOB_ID=$(sbatch \
+            --account="$NERSC_ACCOUNT" \
+            --output="$WORK_DIR/slurm-%j.out" \
+            "$WORK_DIR/run_gpu_tests.sh" "$WORK_DIR" "$GITHUB_WORKSPACE" \
+            | awk '{print $NF}')
+          echo "Submitted SLURM job $JOB_ID"
+          # Cancel the job if this step is cancelled or the runner dies.
+          trap 'scancel "$JOB_ID" 2>/dev/null || true' EXIT
+          trap 'exit 143' INT TERM
+
+          echo "Polling job $JOB_ID every 60 s..."
+          while true; do
+            # Touch a file so the login node doesn't consider this session idle.
+            touch "$WORK_DIR/.runner-keepalive"
+            STATE=$(squeue -j "$JOB_ID" -h -o '%T' 2>/dev/null || true)
+            echo "  $(date '+%H:%M:%S')  state: ${STATE:-DONE}"
+            case "$STATE" in
+              PENDING|CONFIGURING|RUNNING|COMPLETING) sleep 60 & wait $! ;;
+              FAILED|TIMEOUT|CANCELLED|OUT_OF_MEMORY)
+                cat "$WORK_DIR/slurm-$JOB_ID.out" || true
+                echo "::error::SLURM job ended in state: $STATE"
+                exit 1 ;;
+              *) break ;;
+            esac
+          done
+
+          cat "$WORK_DIR/slurm-$JOB_ID.out"
+
+          if [ ! -f "$WORK_DIR/test_exit_code.txt" ]; then
+            echo "::error::SLURM job did not produce test_exit_code.txt — job likely crashed before tests ran"
+            exit 1
+          fi
+          EXIT_CODE=$(tr -d '[:space:]' < "$WORK_DIR/test_exit_code.txt")
+          if [ "$EXIT_CODE" != "0" ]; then
+            echo "::error::GPU tests failed (exit $EXIT_CODE)"
+            exit 1
+          fi
+          echo "All GPU tests passed."
+
+          # Record whether coverage was produced for the next step.
+          [ -f "$WORK_DIR/coverage.xml" ] && echo "coverage=true" >> "$GITHUB_OUTPUT" || true
+
+      - name: Upload coverage to Codecov
+        if: steps.slurm.outputs.coverage == 'true'
+        uses: codecov/codecov-action@v3
+        with:
+          file: ${{ runner.temp }}/firm3d-${{ github.sha }}/coverage.xml
+          flags: unittests
+          name: codecov-perlmutter
+
+
+      ### build base branch for timing comparison
+      - name: Checkout target branch
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.base_ref }}
+          path: base-checkout
+
+      - name: Submit SLURM job and wait (base)
+        id: slurm_base
+        if: github.event_name == 'pull_request' && steps.slurm.outcome == 'success'
+        env:
+          NERSC_ACCOUNT: ${{ secrets.NERSC_ACCOUNT }}
+          WORK_DIR: ${{ runner.temp }}/firm3d-base-${{ github.sha }}
+        run: |
+            mkdir -p "$WORK_DIR"
+            cp base-checkout/.github/scripts/run_gpu_tests.sh "$WORK_DIR/run_gpu_tests.sh"
+
+            JOB_ID=$(sbatch \
+              --account="$NERSC_ACCOUNT" \
+              --output="$WORK_DIR/slurm-%j.out" \
+              "$WORK_DIR/run_gpu_tests.sh" "$WORK_DIR" "$GITHUB_WORKSPACE/base-checkout" \
+              | awk '{print $NF}')
+            echo "Submitted SLURM job $JOB_ID"
+            # Cancel the job if this step is cancelled or the runner dies.
+            trap 'scancel "$JOB_ID" 2>/dev/null || true' EXIT
+            trap 'exit 143' INT TERM
+
+            echo "Polling job $JOB_ID every 60 s..."
+            while true; do
+              # Touch a file so the login node doesn't consider this session idle.
+              touch "$WORK_DIR/.runner-keepalive"
+              STATE=$(squeue -j "$JOB_ID" -h -o '%T' 2>/dev/null || true)
+              echo "  $(date '+%H:%M:%S')  state: ${STATE:-DONE}"
+              case "$STATE" in
+                PENDING|CONFIGURING|RUNNING|COMPLETING) sleep 60 & wait $! ;;
+                FAILED|TIMEOUT|CANCELLED|OUT_OF_MEMORY)
+                  cat "$WORK_DIR/slurm-$JOB_ID.out" || true
+                  echo "::error::SLURM job ended in state: $STATE"
+                  exit 1 ;;
+                *) break ;;
+              esac
+            done
+
+            cat "$WORK_DIR/slurm-$JOB_ID.out"
+
+            if [ ! -f "$WORK_DIR/test_exit_code.txt" ]; then
+              echo "::error::SLURM job did not produce test_exit_code.txt — job likely crashed before tests ran"
+              exit 1
+            fi
+            EXIT_CODE=$(tr -d '[:space:]' < "$WORK_DIR/test_exit_code.txt")
+            if [ "$EXIT_CODE" != "0" ]; then
+              echo "::error::GPU tests failed (exit $EXIT_CODE)"
+              exit 1
+            fi
+            echo "All GPU tests passed."
+
+            # Record whether coverage was produced for the next step.
+            [ -f "$WORK_DIR/coverage.xml" ] && echo "coverage=true" >> "$GITHUB_OUTPUT" || true
+
+      - name: Compare against base
+        id: compare
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        run: |
+          module load cudatoolkit python cray-hdf5/1.14.3.7 cray-netcdf/4.9.2.1
+          CONDA_BASE=$(conda info --base 2>/dev/null || echo "$HOME/.conda")
+          source "$CONDA_BASE/etc/profile.d/conda.sh"
+          conda activate firm3d-ci
+          python .github/scripts/compare_gpu_timing.py \
+            "${{ runner.temp }}/firm3d-base-${{ github.sha }}/gpu_boozer_vacuum_tracing_results.json" \
+            "${{ runner.temp }}/firm3d-${{ github.sha }}/gpu_boozer_vacuum_tracing_results.json" \
+            "GC Boozer Vacuum" \
+            "${{ runner.temp }}/firm3d-base-${{ github.sha }}/gpu_boozer_finitebeta_tracing_results.json" \
+            "${{ runner.temp }}/firm3d-${{ github.sha }}/gpu_boozer_finitebeta_tracing_results.json" \
+            "GC Boozer Finite Beta" \
+            "${{ runner.temp }}/firm3d-base-${{ github.sha }}/gpu_cartesian_tracing_results.json" \
+            "${{ runner.temp }}/firm3d-${{ github.sha }}/gpu_cartesian_tracing_results.json" \
+            "GC Cartesian Vacuum" \
+            "${{ runner.temp }}/firm3d-base-${{ github.sha }}/gpu_boozer_saw_tracing_results.json" \
+            "${{ runner.temp }}/firm3d-${{ github.sha }}/gpu_boozer_saw_tracing_results.json" \
+            "GC Boozer Vacuum + SAW" \
+            "${{ runner.temp }}/firm3d-base-${{ github.sha }}/gpu_saw_nok_tracing_results.json" \
+            "${{ runner.temp }}/firm3d-${{ github.sha }}/gpu_saw_nok_tracing_results.json" \
+            "GC Boozer NoK + SAW" \
+            "${{ runner.temp }}/firm3d-base-${{ github.sha }}/gpu_boozer_collisional_tracing_results.json" \
+            "${{ runner.temp }}/firm3d-${{ github.sha }}/gpu_boozer_collisional_tracing_results.json" \
+            "Boozer Vacuum Collisions" \
+            "${{ runner.temp }}/firm3d-base-${{ github.sha }}/gpu_cartesian_collisional_tracing_results.json" \
+            "${{ runner.temp }}/firm3d-${{ github.sha }}/gpu_cartesian_collisional_tracing_results.json" \
+            "GC Cartesian Collisions" \
+            --pr-status "${{ steps.slurm.outcome }}" \
+            --base-status "${{ steps.slurm_base.outcome }}" \
+            -o "${{ runner.temp }}/firm3d-${{ github.sha }}/pr_comment.md"
+
+      - name: Comment PR with results
+        if: ${{ !cancelled() && steps.compare.outcome == 'success' }}
+        uses: thollander/actions-comment-pull-request@v3
+        with:
+          file-path: ${{ runner.temp }}/firm3d-${{ github.sha }}/pr_comment.md
+          comment-tag: gpu-regression-results
+
+      - name: Clean up work directory
+        if: always()
+        run: |
+            rm -rf "${{ runner.temp }}/firm3d-${{ github.sha }}"
+            rm -rf "${{ runner.temp }}/firm3d-base-${{ github.sha }}"

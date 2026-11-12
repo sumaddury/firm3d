@@ -1,4 +1,3 @@
-from math import sqrt
 from warnings import warn
 
 import numpy as np
@@ -8,12 +7,12 @@ import firm3dpp as sopp
 from .._core.types import RealArray
 from .._core.util import parallel_loop_bounds
 from ..field.boozermagneticfield import BoozerMagneticField, ShearAlfvenWave
+from ..field.tracing_helpers import _validate_parallel_speeds
 from ..util.constants import (
     ALPHA_PARTICLE_CHARGE,
     ALPHA_PARTICLE_MASS,
     FUSION_ALPHA_PARTICLE_ENERGY,
 )
-from ..util.functions import proc0_print
 
 __all__ = [
     "MinToroidalFluxStoppingCriterion",
@@ -21,9 +20,6 @@ __all__ = [
     "IterationStoppingCriterion",
     "ToroidalTransitStoppingCriterion",
     "StepSizeStoppingCriterion",
-    "compute_resonances",
-    "compute_poloidal_transits",
-    "compute_toroidal_transits",
     "trace_particles_boozer",
 ]
 
@@ -81,31 +77,47 @@ def trace_particles_boozer_perturbed(
     where :math:`q` is the charge, :math:`m` is the mass, and
     :math:`v_\perp^2 = 2\mu|B|`.
 
-    In the case of ``mode='gc'`` we solve the general guiding center equations
-    for an MHD equilibrium:
+    Note that the current implementation has no perturbed guiding-center RHS
+    that retains a general :math:`K(s,\theta,\zeta)`. For perturbed tracing,
+    ``mode='gc'`` and ``mode='gc_noK'`` both evaluate the :math:`K=0`
+    equations below; a full-:math:`K` equilibrium is silently treated as
+    :math:`K=0` whenever a shear Alfvén wave perturbation is present. In the
+    case of ``mode='gc'`` we solve the guiding center equations with
+    :math:`K=0`:
 
     .. math::
 
-        \dot s = (I |B|_{,\zeta} - G |B|_{,\theta})m(v_{||}^2/|B| + \mu)
-        /(\iota D \psi_0)
+        \dot s = \Big(-G \Phi_{,\theta}q + I\Phi_{,\zeta}q
+        + |B| qv_{||}(\alpha_{,\theta}G-\alpha_{,\zeta}I)
+        + (-|B|_{,\theta}G + |B|_{,\zeta}I)
+        (mv_{||}^2/|B| + m\mu)\Big)/(D \psi_0)
 
-        \dot \theta = ((G |B|_{,\psi} - K |B|_{,\zeta}) m(v_{||}^2/|B| + \mu)
-        - C v_{||} |B|)/(\iota D)
+        \dot \theta = \Big(G q \Phi_{,\psi}
+        + |B| q v_{||} (-\alpha_{,\psi} G - \alpha G'(\psi) + \iota)
+        - G'(\psi) m v_{||}^2 + |B|_{,\psi} G (mv_{||}^2/|B| + m\mu)\Big)/D
 
-        \dot \zeta = (F v_{||} |B| - (|B|_{,\psi} I - |B|_{,\theta} K)
-        m(\rho_{||}^2 |B| + \mu) )/(\iota D)
+        \dot \zeta = \Big(-I (|B|_{,\psi} m \mu + \Phi_{,\psi} q)
+        + |B| q v_{||} (1 + \alpha_{,\psi} I + \alpha I'(\psi))
+        + (m v_{||}^2/|B|) (|B| I'(\psi) - |B|_{,\psi} I)\Big)/D
 
-        \dot v_{||} = (C|B|_{,\theta} - F|B|_{,\zeta})\mu |B|/(\iota D)
+        \dot v_{||} = \Big((|B|q/m) \big(-m \mu
+        (|B|_{,\zeta}(1 + \alpha_{,\psi} I + \alpha I'(\psi))
+        + |B|_{,\psi} (\alpha_{,\theta} G - \alpha_{,\zeta} I)
+        + |B|_{,\theta} (\iota - \alpha G'(\psi) - \alpha_{,\psi} G))
+        - q \big(\dot{\alpha} (G + I (\iota - \alpha G'(\psi)) + \alpha G I'(\psi))
+        + (\alpha_{,\theta} G - \alpha_{,\zeta} I) \Phi_{,\psi}
+        + (\iota - \alpha G'(\psi) - \alpha_{,\psi} G) \Phi_{,\theta}
+        + (1 + \alpha I'(\psi) + \alpha_{,\psi} I) \Phi_{,\zeta}\big) \big)
+        + (q v_{||}/|B|) \big((|B|_{,\theta} G - |B|_{,\zeta} I) \Phi_{,\psi}
+        + |B|_{,\psi} (I \Phi_{,\zeta} - G \Phi_{,\theta})\big)
+        + v_{||} \big(m \mu (|B|_{,\theta} G'(\psi) - |B|_{,\zeta} I'(\psi))
+        + q (\dot \alpha (G'(\psi) I - G I'(\psi))
+        + G'(\psi) \Phi_{,\theta} - I'(\psi)\Phi_{,\zeta})\big)\Big)/D
 
-        C = - m v_{||} K_{,\zeta}/|B|  - q \iota + m v_{||}G'/|B|
+        D = q (G + I(-\alpha G'(\psi) + \iota) + \alpha G I'(\psi))
+        + (m v_{||}/|B|) (-G'(\psi)I + G I'(\psi))
 
-        F = - m v_{||} K_{,\theta}/|B| + q + m v_{||}I'/|B|
-
-        D = (F G - C I)/\iota
-
-    where primes indicate differentiation wrt :math:`\psi`. In the case
-    ``mode='gc_noK'``,
-    the above equations are used with :math:`K=0`.
+    where primes indicate differentiation wrt :math:`\psi`.
 
     Args:
         perturbed_field: The :class:`ShearAlfvenWave` instance
@@ -137,10 +149,10 @@ def trace_particles_boozer_perturbed(
         n_zetas: list of toroidal mode numbers for stopping criterion
         m_thetas: list of poloidal mode numbers for stopping criterion
         omegas: list of frequencies defining a stopping criterion such that
-              n_zetas*zetas + m_thetas*thetas - omega_thetas*t = phase. Must have the
-              same length as thetas.
+              n_zetas*zeta + m_thetas*theta - omegas*t = phases. Must have the
+              same length as phases.
               If provided, the solver will stop when the particle hits the
-              plane defined by thetas and omega_thetas.
+              plane defined by n_zetas, m_thetas, and omegas.
         vpars: list of parallel velocities defining a stopping criterion such
               that the solver will stop when the particle hits these values.
         stopping_criteria: list of stopping criteria, mostly used in
@@ -167,6 +179,8 @@ def trace_particles_boozer_perturbed(
             (s*cos(theta),s*sin(theta),zeta). Option 2 is recommended.
         ODE_solver: Which ODE solver to use, can be "boost" or "dormand prince".
             Defaults to "boost".
+        DP_hmin: Minimal timestep, in seconds, as for
+            :func:`trace_particles_boozer`.
     Returns: 2 element tuple containing
         - ``res_tys``:
             A list of numpy arrays (one for each particle) describing the
@@ -175,37 +189,34 @@ def trace_particles_boozer_perturbed(
 
         - ``res_hits``:
             A list of numpy arrays (one for each particle) containing
-            information on each time the particle hits one of the zeta planes or
+            information on each time the particle hits one of the phase planes or
             one of the stopping criteria. Each row or the array contains
             `[time] + [idx] + state`, where `idx` tells us which of the hit
             planes or stopping criteria was hit.
             If `idx>=0` and `idx<len(phases)`, then the `phases[idx]` plane was
             hit. If `len(vpars)+len(phases)>idx>=len(phases)`, then the
-            `vpars[idx-len(phases)]` plane was hit.
-            If `idx>=len(vpars)+len(phases)`, then the
-            `thetas[idx-len(vpars)-len(phases)]` plane was hit.
+            `vpars[idx-len(phases)]` value was hit.
             If `idx<0`, then `stopping_criteria[int(-idx)-1]` was hit. The
             state vector is `[s, theta, zeta, v_par, t]`.
     """
     if stopping_criteria is None:
         stopping_criteria = []
-    if vpars is None:
-        vpars = []
-    if phases is None:
-        phases = []
-    if n_zetas is None:
-        n_zetas = []
-    if m_thetas is None:
-        m_thetas = []
-    if omegas is None:
-        omegas = []
+    phases = [float(p) for p in (phases or [])]
+    vpars = [float(x) for x in (vpars or [])]
+    n_zetas = [float(x) for x in (n_zetas or [])]
+    m_thetas = [float(x) for x in (m_thetas or [])]
+    omegas = [float(x) for x in (omegas or [])]
     if reltol is None:
         reltol = tol
     if abstol is None:
         abstol = tol
+    if dt_save <= 0:
+        raise ValueError("dt_save must be positive.")
+
     nparticles = stz_inits.shape[0]
     assert stz_inits.shape[0] == len(parallel_speeds)
     assert len(mus) == len(parallel_speeds)
+
     speed_par = parallel_speeds
     m = mass
     if Ekin is None:
@@ -213,9 +224,9 @@ def trace_particles_boozer_perturbed(
             np.asarray([[stz_inits[0, 0]], [stz_inits[0, 1]], [stz_inits[0, 2]], [0]]).T
         )
         B0 = perturbed_field.B0.modB()[0, 0]
-        speed_total = sqrt(speed_par[0] ** 2 + 2 * mus[0] * B0)
+        speed_total = float(np.sqrt(speed_par[0] ** 2 + 2 * mus[0] * B0))
     else:
-        speed_total = sqrt(2 * Ekin / m)
+        speed_total = float(np.sqrt(2 * Ekin / m))
 
     if mode is not None:
         mode = mode.lower()
@@ -236,15 +247,15 @@ def trace_particles_boozer_perturbed(
     for i in range(first, last):
         res_ty, res_hit = sopp.particle_guiding_center_boozer_perturbed_tracing(
             perturbed_field,
-            stz_inits[i, :],
-            m,
-            charge,
-            speed_total,
-            speed_par[i],
-            mus[i],
-            tmax,
-            abstol,
-            reltol,
+            stz_inits[i, :].tolist(),
+            float(m),
+            float(charge),
+            float(speed_total),
+            float(speed_par[i]),
+            float(mus[i]),
+            float(tmax),
+            float(abstol),
+            float(reltol),
             vacuum=(mode == "gc_vac"),
             noK=(mode == "gc_nok"),
             phases=phases,
@@ -372,10 +383,10 @@ def trace_particles_boozer(
         n_zetas: list of toroidal mode numbers for stopping criterion
         m_thetas: list of poloidal mode numbers for stopping criterion
         omegas: list of frequencies defining a stopping criterion such that
-              n_zetas*zetas + m_thetas*thetas - omega_thetas*t = phase. Must have the
-              same length as thetas.
+              n_zetas*zeta + m_thetas*theta - omegas*t = phases. Must have the
+              same length as phases.
               If provided, the solver will stop when the particle hits the
-              plane defined by thetas and omega_thetas.
+              plane defined by n_zetas, m_thetas, and omegas.
         vpars: list of parallel velocities defining a stopping criterion such
               that the solver will stop when the particle hits these values.
         stopping_criteria: list of stopping criteria, mostly used in
@@ -407,10 +418,12 @@ def trace_particles_boozer(
             `ODE_solver` is "symplectic". If None, defaults to `tol`.
         predictor_step: provide better initial guess for the next time step
             using predictor steps. Defaults to True if `ODE_solver` is "symplectic".
-        DP_hmin: Minimal timestep to enforce during numerical integration with adaptive
-            timestep. If the adaptice time step gets below DP_hmin, the stepper
-            completes step with DP_hmin timestep. Default is 0.0. Only used if
-            `ODE_solver` is "dormand_prince".
+        DP_hmin: Minimal timestep, in seconds, to enforce during numerical
+            integration with adaptive timestep. If the adaptive time step gets
+            below DP_hmin, the stepper completes the step with DP_hmin anyway.
+            It must not exceed the maximum step, a quarter of a toroidal
+            transit. Default is 0.0. Only used if `ODE_solver` is
+            "dormand_prince".
     Returns: 2 element tuple containing
         - ``res_tys``:
             A list of numpy arrays (one for each particle) describing the
@@ -419,18 +432,21 @@ def trace_particles_boozer(
 
         - ``res_hits``:
             A list of numpy arrays (one for each particle) containing
-            information on each time the particle hits one of the zeta planes or
+            information on each time the particle hits one of the phase planes or
             one of the stopping criteria. Each row or the array contains
             `[time] + [idx] + state`, where `idx` tells us which of the hit
             planes or stopping criteria was hit.
-            If `idx>=0` and `idx<len(phases)`, then the `zetas[idx]` plane was hit.
+            If `idx>=0` and `idx<len(phases)`, then the `phases[idx]` plane was hit.
             If `len(vpars)+len(phases)>idx>=len(phases)`, then the
-            `vpars[idx-len(phases)]` plane was hit.
-            If `idx>=len(vpars)+len(phases)`, then the
-            `thetas[idx-len(vpars)-len(phases)]` plane was hit.
+            `vpars[idx-len(phases)]` value was hit.
             If `idx<0`, then `stopping_criteria[int(-idx)-1]` was hit.
             The state vector is `[s, theta, zeta, v_par]`.
     """
+    if isinstance(field, ShearAlfvenWave):
+        raise TypeError(
+            "trace_particles_boozer traces equilibrium fields; use "
+            "trace_particles_boozer_perturbed for a field with shear Alfven waves"
+        )
     if stopping_criteria is None:
         stopping_criteria = []
     if vpars is None:
@@ -484,6 +500,9 @@ def trace_particles_boozer(
     if predictor_step is None:
         predictor_step = True
 
+    if dt_save <= 0:
+        raise ValueError("dt_save must be positive.")
+
     nparticles = stz_inits.shape[0]
     assert stz_inits.shape[0] == len(parallel_speeds)
     speed_par = parallel_speeds
@@ -493,6 +512,7 @@ def trace_particles_boozer(
         Ekin = Ekin * np.ones((len(parallel_speeds),))
     # Ekin = 0.5 * m * v^2 <=> v = sqrt(2*Ekin/m)
     speed_total = np.sqrt(2 * Ekin / m)
+    _validate_parallel_speeds(speed_par, speed_total)
 
     if mode is not None:
         mode = mode.lower()
@@ -511,13 +531,16 @@ def trace_particles_boozer(
     res_hits = []
     first, last = parallel_loop_bounds(comm, nparticles)
     for i in range(first, last):
+        # Convert to Python scalars to ensure compatibility with C++ bindings
+        vtotal = np.asarray(speed_total[i]).item()
+        vpar = np.asarray(speed_par[i]).item()
         res_ty, res_hit = sopp.particle_guiding_center_boozer_tracing(
             field,
             stz_inits[i, :],
             m,
             charge,
-            speed_total[i],
-            speed_par[i],
+            vtotal,
+            vpar,
             tmax,
             vacuum=(mode == "gc_vac"),
             noK=(mode == "gc_nok"),
@@ -549,133 +572,6 @@ def trace_particles_boozer(
         res_tys = [i for o in comm.allgather(res_tys) for i in o]
         res_hits = [i for o in comm.allgather(res_hits) for i in o]
     return res_tys, res_hits
-
-
-def compute_resonances(res_tys, res_hits, delta=1e-2):
-    r"""
-    Computes resonant particle orbits given the output of
-    :func:`trace_particles_boozer`, ``res_tys`` and
-    ``res_hits``, with ``forget_exact_path=False``. Resonance indicates a
-    trajectory which returns to the same position
-    at the :math:`\zeta = 0` plane after ``mpol`` poloidal turns and
-    ``ntor`` toroidal turns.
-
-    Args:
-        res_tys: trajectory solution computed from :func:`trace_particles` or
-                :func:`trace_particles_boozer` with ``forget_exact_path=False``
-        res_hits: output of :func:`trace_particles_boozer` with `zetas = [0]`
-        delta: the distance tolerance in the poloidal plane used to compute
-                a resonant orbit. (defaults to 1e-2)
-
-    Returns:
-        resonances: list of 7d arrays containing resonant particle orbits. The
-                elements of each array is
-                ``[s0, theta0, zeta0, vpar0, t, mpol, ntor]``.
-                Here ``(s0, theta0, zeta0, vpar0)`` indicates the
-                initial position and parallel velocity of the particle, ``t``
-                indicates the time of the  resonance, ``mpol`` is the number of
-                poloidal turns of the orbit, and ``ntor`` is the number of
-                toroidal turns.
-    """
-    nparticles = len(res_tys)
-    resonances = []
-    # Iterate over particles
-    for ip in range(nparticles):
-        nhits = len(res_hits[ip])
-        s0 = res_tys[ip][0, 1]
-        theta0 = res_tys[ip][0, 2]
-        zeta0 = res_tys[ip][0, 3]
-        theta0_mod = theta0 % (2 * np.pi)
-        x0 = s0 * np.cos(theta0)
-        y0 = s0 * np.sin(theta0)
-        vpar0 = res_tys[ip][0, 4]
-        for it in range(1, nhits):
-            # Check whether phi hit or stopping criteria achieved
-            if int(res_hits[ip][it, 1]) >= 0:
-                s = res_hits[ip][it, 2]
-                theta = res_hits[ip][it, 3]
-                zeta = res_hits[ip][it, 4]
-                theta_mod = theta % 2 * np.pi
-                x = s * np.cos(theta)
-                y = s * np.sin(theta)
-                dist = np.sqrt((x - x0) ** 2 + (y - y0) ** 2)
-                t = res_hits[ip][it, 0]
-                if dist < delta:
-                    proc0_print("Resonance found.")
-                    proc0_print(
-                        f"theta = {theta_mod}, theta0 = {theta0_mod}, "
-                        f"s = {s}, s0 = {s0}"
-                    )
-                    mpol = np.rint((theta - theta0) / (2 * np.pi))
-                    ntor = np.rint((zeta - zeta0) / (2 * np.pi))
-                    resonances.append(
-                        np.asarray([s0, theta0, zeta0, vpar0, t, mpol, ntor])
-                    )
-    return resonances
-
-
-def compute_toroidal_transits(res_tys):
-    r"""
-    Computes the number of toroidal transits of an orbit.
-
-    Args:
-        res_tys: trajectory solution computed from :func:`trace_particles_boozer`
-            with ``forget_exact_path=False``.
-
-    Returns:
-        ntransits: array with length ``len(res_tys)``. Each element contains the
-                number of toroidal transits of the orbit.
-    """
-    nparticles = len(res_tys)
-    ntransits = np.zeros((nparticles,))
-    for ip in range(nparticles):
-        ntraj = len(res_tys[ip][:, 0])
-        phi_init = res_tys[ip][0, 3]
-        for it in range(1, ntraj):
-            phi = res_tys[ip][it, 3]
-        if ntraj > 1:
-            ntransits[ip] = np.round((phi - phi_init) / (2 * np.pi))
-    return ntransits
-
-
-def compute_poloidal_transits(res_tys, ma=None, flux=True):
-    r"""
-    Computes the number of poloidal transits of an orbit. For the case of
-    particles traced in a :class:`MagneticField` (not a :class:`BoozerMagneticField`),
-    the poloidal angle is computed using the arctangent angle in the poloidal plane with
-    respect to the coordinate axis, ``ma``,
-
-    .. math::
-        \theta = \tan^{-1} \left( \frac{R(\phi)-R_{\mathrm{ma}}(\phi)}
-        {Z(\phi)-Z_{\mathrm{ma}}(\phi)} \right),
-
-    where :math:`(R,\phi,Z)` are the cylindrical coordinates of the trajectory
-    and :math:`(R_{\mathrm{ma}}(\phi),Z_{\mathrm{ma}(\phi)})` is the position
-    of the coordinate axis.
-
-    Args:
-        res_tys: trajectory solution computed from :func:`trace_particles` or
-                :func:`trace_particles_boozer` with ``forget_exact_path=False``.
-        ma: an instance of :class:`Curve` representing the coordinate axis with
-                respect to which the poloidal angle is computed. If orbit is
-                computed in Boozer coordinates, ``ma`` should be ``None``.
-        flux: if ``True``, ``res_tys`` represents the position in flux coordinates
-                (should be ``True`` if computed from :func:`trace_particles_boozer`).
-                If ``True``, ``ma`` is not used.
-    Returns:
-        ntransits: array with length ``len(res_tys)``. Each element contains the
-                number of poloidal transits of the orbit.
-    """
-    nparticles = len(res_tys)
-    ntransits = np.zeros((nparticles,))
-    for ip in range(nparticles):
-        ntraj = len(res_tys[ip][:, 0])
-        theta_init = res_tys[ip][0, 2]
-        for it in range(1, ntraj):
-            theta = res_tys[ip][it, 2]
-        if ntraj > 1:
-            ntransits[ip] = np.round((theta - theta_init) / (2 * np.pi))
-    return ntransits
 
 
 class MinToroidalFluxStoppingCriterion(sopp.MinToroidalFluxStoppingCriterion):
@@ -725,11 +621,9 @@ class ToroidalTransitStoppingCriterion(sopp.ToroidalTransitStoppingCriterion):
 
     .. code-block::
 
-        stopping_criteria=[ToroidalTransitStoppingCriterion(ntransits,flux)]
+        stopping_criteria=[ToroidalTransitStoppingCriterion(ntransits)]
 
-    where ``ntransits`` is the maximum number of toroidal transits and ``flux``
-    is a boolean indicating whether tracing is being performed in a flux
-    coordinate system.
+    where ``ntransits`` is the maximum number of toroidal transits.
     """
 
     pass

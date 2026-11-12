@@ -14,13 +14,16 @@ The core routines are based on `SIMSOPT <https://simsopt.readthedocs.io>`_, but 
    :maxdepth: 2
    :caption: Contents:
 
+   README
    installation
    magnetic_fields
    shear_alfven_waves
    guiding_center
+   collisions
    poincare_maps
    stopping_criteria
    trajectory_saving
+   gpu_tracing
    magnetic_axis
    solvers
    api

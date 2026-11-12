@@ -1,7 +1,5 @@
 import numpy as np
 
-from .._core.util import parallel_loop_bounds
-
 __all__ = [
     "initialize_position_uniform_surf",
     "initialize_position_profile",
@@ -24,16 +22,19 @@ def initialize_position_uniform_surf(
         ns_max : Number of points in s direction for Jacobian computation
         ntheta_max : Number of points in theta direction for Jacobian computation
         nzeta_max : Number of points in zeta direction for Jacobian computation
-        comm : MPI communicator (default: None)
-        seed: Random seed for reproducibility (default: None, uses random seed
-            from numpy)
+        comm : MPI communicator (default: None). Sampling is performed on rank
+            0 and the result is broadcast, so the returned positions do not
+            depend on the number of ranks.
+        seed: Random seed for reproducibility (default: None, in which case the
+            global numpy RNG is left untouched)
 
     Returns:
         points: A numpy array of shape (nparticles, 3) containing the
             initialized particle positions in Boozer coordinates (s, theta, zeta).
     """
     nfp = field.nfp
-    np.random.seed(seed)
+    if seed is not None:
+        np.random.seed(seed)
     # Compute max value of Jacobian on a grid for normalization
     theta_grid = np.linspace(0, 2 * np.pi, ntheta_max, endpoint=False)
     zeta_grid = np.linspace(0, 2 * np.pi / nfp, nzeta_max, endpoint=False)
@@ -50,48 +51,59 @@ def initialize_position_uniform_surf(
     modB = field.modB()
     J = (G + iota * I) / (modB**2)
 
-    J_max = np.max(J)
+    J_vals = J.flatten()
+    if np.all(J_vals > 0):
+        sign = 1
+    elif np.all(J_vals < 0):
+        sign = -1
+    else:
+        raise ValueError(
+            "Jacobian J = (G + iota*I)/B^2 changes sign across the surface. "
+            "Cannot form a valid probability distribution for rejection sampling."
+        )
+    J_max = np.max(J_vals * sign)
 
-    theta_init = []
-    zeta_init = []
-    s_init = []
-    points = np.zeros((1, 3))
+    # Sample on rank 0 only and broadcast the result.
+    root = comm.rank == 0 if comm is not None else True
 
-    first, last = parallel_loop_bounds(comm, nparticles)
-    for _i in range(first, last):
-        while True:
-            rand1 = np.random.uniform(0, 1, None)
-            theta = np.random.uniform(0, 2 * np.pi, None)
-            zeta = np.random.uniform(0, 2 * np.pi / nfp, None)
-            points[:, 0] = s
-            points[:, 1] = theta
-            points[:, 2] = zeta
-            field.set_points(points)
-            J = (field.G()[0, 0] + field.iota()[0, 0] * field.I()[0, 0]) / (
-                field.modB()[0, 0] ** 2
-            )
+    stz_init = None
+    if root:
+        theta_init = []
+        zeta_init = []
+        s_init = []
+        points = np.zeros((1, 3))
 
-            # Normalize the Jacobian
-            prob_norm = J / J_max
+        for _i in range(nparticles):
+            while True:
+                rand1 = np.random.uniform(0, 1, None)
+                theta = np.random.uniform(0, 2 * np.pi, None)
+                zeta = np.random.uniform(0, 2 * np.pi / nfp, None)
+                points[:, 0] = s
+                points[:, 1] = theta
+                points[:, 2] = zeta
+                field.set_points(points)
+                J = (field.G()[0, 0] + field.iota()[0, 0] * field.I()[0, 0]) / (
+                    field.modB()[0, 0] ** 2
+                )
 
-            if rand1 <= prob_norm:
-                s_init.append(s)
-                theta_init.append(theta)
-                zeta_init.append(zeta)
-                break
+                # Normalize the Jacobian
+                prob_norm = J * sign / J_max
 
-    # Gather all particle positions across all processes
+                if rand1 <= prob_norm:
+                    s_init.append(s)
+                    theta_init.append(theta)
+                    zeta_init.append(zeta)
+                    break
+
+        stz_init = np.zeros((nparticles, 3))
+        stz_init[:, 0] = np.asarray(s_init)
+        stz_init[:, 1] = np.asarray(theta_init)
+        stz_init[:, 2] = np.asarray(zeta_init)
+
     if comm is not None:
-        s_init = [i for o in comm.allgather(s_init) for i in o]
-        theta_init = [i for o in comm.allgather(theta_init) for i in o]
-        zeta_init = [i for o in comm.allgather(zeta_init) for i in o]
+        stz_init = comm.bcast(stz_init, root=0)
 
-    points = np.zeros((nparticles, 3))
-    points[:, 0] = np.asarray(s_init)
-    points[:, 1] = np.asarray(theta_init)
-    points[:, 2] = np.asarray(zeta_init)
-
-    return points
+    return stz_init
 
 
 def initialize_position_profile(
@@ -132,9 +144,11 @@ def initialize_position_profile(
         ns_max : Number of points in s direction for Jacobian computation
         ntheta_max : Number of points in theta direction for Jacobian computation
         nzeta_max : Number of points in zeta direction for Jacobian computation
-        comm : MPI communicator (default: None)
-        seed: Random seed for reproducibility (default: None, uses random seed
-            from numpy)
+        comm : MPI communicator (default: None). Sampling is performed on rank
+            0 and the result is broadcast, so the returned positions do not
+            depend on the number of ranks.
+        seed: Random seed for reproducibility (default: None, in which case the
+            global numpy RNG is left untouched)
 
     Returns:
         points: A numpy array of shape (nparticles, 3) containing the
@@ -146,7 +160,8 @@ def initialize_position_profile(
             "argument (s) and returns a value."
         )
 
-    np.random.seed(seed)
+    if seed is not None:
+        np.random.seed(seed)
     # Compute max value of Jacobian and p on a grid for normalization
     nfp = field.nfp
     s_grid = np.linspace(0, 1, ns_max)
@@ -165,53 +180,68 @@ def initialize_position_profile(
     modB = field.modB()
     J = (G + iota * I) / (modB**2)
 
+    # The Jacobian must be single-signed over the domain for rejection sampling
+    # to work correctly.  Some equilibria have J < 0 everywhere; flip the sign
+    # so the probability weight is always positive.
+    J_vals = J[:, 0]
+    if np.all(J_vals > 0):
+        sign = 1
+    elif np.all(J_vals < 0):
+        sign = -1
+    else:
+        raise ValueError(
+            "Jacobian J = (G + iota*I)/B^2 changes sign across the domain. "
+            "Cannot form a valid probability distribution for rejection sampling."
+        )
+
     # Compute normalized profile values on the grid
     profile_values = np.array([profile(s) for s in s_grid.flatten()])
     prob_max = np.max(
-        J[:, 0] * profile_values
+        J_vals * sign * profile_values
     )  # Normalize by the maximum value of J * profile
 
-    theta_init = []
-    zeta_init = []
-    s_init = []
-    points = np.zeros((1, 3))
+    # Sample on rank 0 only and broadcast the result.
+    root = comm.rank == 0 if comm is not None else True
 
-    first, last = parallel_loop_bounds(comm, nparticles)
-    for _i in range(first, last):
-        while True:
-            rand1 = np.random.uniform(0, 1, None)
-            s = np.random.uniform(0, 1.0, None)
-            theta = np.random.uniform(0, 2 * np.pi, None)
-            zeta = np.random.uniform(0, 2 * np.pi / nfp, None)
-            points[:, 0] = s
-            points[:, 1] = theta
-            points[:, 2] = zeta
-            field.set_points(points)
-            J = (field.G()[0, 0] + field.iota()[0, 0] * field.I()[0, 0]) / (
-                field.modB()[0, 0] ** 2
-            )
+    stz_init = None
+    if root:
+        theta_init = []
+        zeta_init = []
+        s_init = []
+        points = np.zeros((1, 3))
 
-            # Normalize the probability
-            prob_norm = J * profile(s) / prob_max
+        for _i in range(nparticles):
+            while True:
+                rand1 = np.random.uniform(0, 1, None)
+                s = np.random.uniform(0, 1.0, None)
+                theta = np.random.uniform(0, 2 * np.pi, None)
+                zeta = np.random.uniform(0, 2 * np.pi / nfp, None)
+                points[:, 0] = s
+                points[:, 1] = theta
+                points[:, 2] = zeta
+                field.set_points(points)
+                J = (field.G()[0, 0] + field.iota()[0, 0] * field.I()[0, 0]) / (
+                    field.modB()[0, 0] ** 2
+                )
 
-            if rand1 <= prob_norm:
-                s_init.append(s)
-                theta_init.append(theta)
-                zeta_init.append(zeta)
-                break
+                # Normalize the probability
+                prob_norm = J * sign * profile(s) / prob_max
 
-    # Gather all particle positions across all processes
+                if rand1 <= prob_norm:
+                    s_init.append(s)
+                    theta_init.append(theta)
+                    zeta_init.append(zeta)
+                    break
+
+        stz_init = np.zeros((nparticles, 3))
+        stz_init[:, 0] = np.asarray(s_init)
+        stz_init[:, 1] = np.asarray(theta_init)
+        stz_init[:, 2] = np.asarray(zeta_init)
+
     if comm is not None:
-        s_init = [i for o in comm.allgather(s_init) for i in o]
-        theta_init = [i for o in comm.allgather(theta_init) for i in o]
-        zeta_init = [i for o in comm.allgather(zeta_init) for i in o]
+        stz_init = comm.bcast(stz_init, root=0)
 
-    points = np.zeros((nparticles, 3))
-    points[:, 0] = np.asarray(s_init)
-    points[:, 1] = np.asarray(theta_init)
-    points[:, 2] = np.asarray(zeta_init)
-
-    return points
+    return stz_init
 
 
 def initialize_position_uniform_vol(
@@ -233,9 +263,11 @@ def initialize_position_uniform_vol(
         ns_max : Number of points in s direction for Jacobian computation
         ntheta_max : Number of points in theta direction for Jacobian computation
         nzeta_max : Number of points in zeta direction for Jacobian computation
-        comm : MPI communicator (default: None)
-        seed: Random seed for reproducibility (default: None, uses random seed
-            from numpy)
+        comm : MPI communicator (default: None). Sampling is performed on rank
+            0 and the result is broadcast, so the returned positions do not
+            depend on the number of ranks.
+        seed: Random seed for reproducibility (default: None, in which case the
+            global numpy RNG is left untouched)
 
     Returns:
         points: A numpy array of shape (nparticles, 3) containing the
@@ -253,11 +285,12 @@ def initialize_position_uniform_vol(
     )
 
 
-def initialize_velocity_uniform(vpar0, nParticles, comm=None, seed=None):
+def initialize_velocity_uniform(v0, nParticles, comm=None, seed=None):
     r"""
-    Initialize parallel velocities uniformly distributed in the range [-vpar0, vpar0].
+    Initialize parallel velocities uniformly distributed in the range [-v0, v0].
     Args:
-        vpar0: Maximum parallel velocity magnitude.
+        v0: Total speed. Drawing the parallel velocity uniformly in
+            [-v0, v0] at fixed energy gives an isotropic pitch angle.
         nParticles: Number of particles to initialize.
         comm: MPI communicator (default: None).
         seed: Random seed for reproducibility (default: None, uses random seed
@@ -273,8 +306,28 @@ def initialize_velocity_uniform(vpar0, nParticles, comm=None, seed=None):
         np.random.seed(seed)
 
     # Initialize uniformly distributed parallel velocities
-    vpar_init = np.random.uniform(-vpar0, vpar0, (nParticles,)) if verbose else None
+    vpar_init = np.random.uniform(-v0, v0, (nParticles,)) if verbose else None
     if comm is not None:
         vpar_init = comm.bcast(vpar_init, root=0)
 
     return vpar_init
+
+
+def _validate_parallel_speeds(parallel_speeds, vtotal):
+    r"""
+    Raise if ``vtotal`` is not finite and positive, since it sets the velocity
+    and time normalization, or if any :math:`|v_\parallel|` exceeds it by more
+    than rounding, which would make :math:`\mu = (v^2 - v_\parallel^2)/(2|B|)`
+    negative.  ``vtotal`` may be a scalar or a per-particle array; the "not"
+    forms also reject NaN.  The C++ tracers clamp :math:`|v_\parallel|` to
+    ``vtotal``.
+    """
+    vtotal = np.asarray(vtotal, dtype=float)
+    if not np.all(np.isfinite(vtotal) & (vtotal > 0.0)):
+        raise ValueError("vtotal must be finite and positive")
+    parallel_speeds = np.asarray(parallel_speeds)
+    eps = np.finfo(np.result_type(parallel_speeds, np.float32)).eps
+    if not np.all(np.abs(parallel_speeds) <= vtotal * (1 + 4 * eps)):
+        raise ValueError(
+            "|parallel_speeds| must not exceed vtotal, else mu is negative"
+        )
